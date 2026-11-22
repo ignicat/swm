@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=swm
+Comment=simple window manager for Wayland
+Exec=swm-session
+TryExec=swm-session
+Type=Application
+DesktopNames=SWM
+Keywords=wayland;compositor;windowmanager;

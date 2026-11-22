@@ -1,0 +1,187 @@
+#!/bin/sh
+
+# A local installation keeps its launcher and binary together. Explicit
+# overrides also survive the user manager handoff.
+if [ -z "${SWM_BIN:-}" ]; then
+    case "$0" in
+        */*)
+            launcher_directory=$(CDPATH= cd -- "${0%/*}" 2>/dev/null && pwd -P)
+            if [ -n "$launcher_directory" ] && [ -x "$launcher_directory/swm" ]; then
+                SWM_BIN=$launcher_directory/swm
+            fi
+            ;;
+    esac
+fi
+SWM_BIN=${SWM_BIN:-/usr/bin/swm}
+if [ ! -x "$SWM_BIN" ] && command -v swm >/dev/null 2>&1; then
+    SWM_BIN=$(command -v swm)
+fi
+export SWM_BIN
+
+# A managed service enters through this same launcher so SWM_BIN is honored.
+# Exec preserves the service's main PID and lets swm send its readiness signal.
+if [ -n "${MANAGERPID:-}" ] && [ "${SYSTEMD_EXEC_PID:-}" = "$$" ]; then
+    case "$(ps -p "$MANAGERPID" -o args= 2>/dev/null)" in
+        *systemd*--user*)
+            export SWM_SESSION_LAUNCHER_ACTIVE=1
+            exec "${SWM_BIN:-/usr/bin/swm}" --session "$@"
+            ;;
+    esac
+fi
+
+# Display managers do not consistently start sessions through the user's login
+# shell. Re-enter it once so PATH, agents, and user environment match a normal
+# login before exporting swm's desktop identity.
+if [ "${SWM_SESSION_LOGIN_READY:-}" != 1 ] \
+    && [ -n "${SHELL:-}" ] \
+    && grep -Fxq "$SHELL" /etc/shells 2>/dev/null \
+    && ! printf '%s\n' "$SHELL" | grep -Eq '(false|nologin)$'; then
+    export SWM_SESSION_LOGIN_READY=1
+    quoted_script=$(printf '%s' "$0" | sed "s/'/'\\\\''/g")
+    session_command="exec '$quoted_script'"
+    for argument do
+        quoted=$(printf '%s' "$argument" | sed "s/'/'\\\\''/g")
+        session_command="$session_command '$quoted'"
+    done
+    exec "$SHELL" -l -c "$session_command"
+fi
+unset SWM_SESSION_LOGIN_READY
+
+export XDG_SESSION_TYPE=wayland
+export XDG_CURRENT_DESKTOP=SWM
+export XDG_SESSION_DESKTOP=SWM
+export DESKTOP_SESSION=SWM
+
+init_integration_enabled() {
+    case "${SWM_NO_INIT_INTEGRATION:-}" in
+        1 | true | yes | on) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+is_systemd_managed() {
+    [ -d /run/systemd/system ]
+}
+
+manager_service_uses_selected_binary() {
+    [ "$SWM_BIN" = /usr/bin/swm ]
+}
+
+systemd_service_uses_launcher() {
+    systemctl --user show --property=ExecStart --value swm.service 2>/dev/null \
+        | grep -Eq 'path=[^ ;]*/swm-session[ ;]'
+}
+
+sync_dbus_environment() {
+    if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+        dbus-update-activation-environment --all >/dev/null 2>&1 || true
+    fi
+}
+
+unset_systemd_environment() {
+    systemctl --user unset-environment \
+        WAYLAND_DISPLAY DISPLAY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP \
+        XDG_SESSION_DESKTOP DESKTOP_SESSION XCURSOR_SIZE SWM_BIN >/dev/null 2>&1 || true
+}
+
+if init_integration_enabled \
+    && is_systemd_managed \
+    && command -v systemctl >/dev/null 2>&1 \
+    && [ "$#" -eq 0 ] \
+    && systemctl --user cat swm.service >/dev/null 2>&1 \
+    && { manager_service_uses_selected_binary || systemd_service_uses_launcher; }; then
+    if systemctl --user --quiet is-active swm.service; then
+        echo 'swm session is already running.' >&2
+        exit 1
+    fi
+
+    systemd_cleanup_done=
+    cleanup_systemd() {
+        [ -z "$systemd_cleanup_done" ] || return
+        systemd_cleanup_done=1
+        systemctl --user start --job-mode=replace-irreversibly \
+            swm-shutdown.target >/dev/null 2>&1 \
+            || systemctl --user stop graphical-session.target \
+                graphical-session-pre.target >/dev/null 2>&1 \
+            || true
+        unset_systemd_environment
+    }
+    trap cleanup_systemd 0 INT TERM HUP
+
+    systemctl --user reset-failed >/dev/null 2>&1 || true
+    systemctl --user import-environment >/dev/null 2>&1 || true
+    sync_dbus_environment
+
+    systemctl --user --wait start swm.service
+    status=$?
+    cleanup_systemd
+    exit "$status"
+fi
+
+dinit_resources_exist() {
+    for directory in \
+        "${XDG_CONFIG_HOME:-$HOME/.config}/dinit.d" \
+        "$HOME/.dinit.d" \
+        /etc/dinit.d/user \
+        /usr/lib/dinit.d/user \
+        /usr/local/lib/dinit.d/user; do
+        if [ -f "$directory/swm" ] && [ -f "$directory/swm.target" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+if init_integration_enabled \
+    && manager_service_uses_selected_binary \
+    && [ "$#" -eq 0 ] \
+    && command -v dinitctl >/dev/null 2>&1 \
+    && command -v dinit-monitor >/dev/null 2>&1 \
+    && command -v pgrep >/dev/null 2>&1 \
+    && pgrep -u "$(id -u)" -x dinit >/dev/null 2>&1 \
+    && dinit_resources_exist; then
+    if dinitctl --quiet --user is-started swm 2>/dev/null; then
+        echo 'swm session is already running.' >&2
+        exit 1
+    fi
+
+    dinit_cleanup_done=
+    cleanup_dinit() {
+        [ -z "$dinit_cleanup_done" ] || return
+        dinit_cleanup_done=1
+        dinitctl --quiet --user stop swm.target >/dev/null 2>&1 || true
+        dinitctl --quiet --user unsetenv \
+            WAYLAND_DISPLAY DISPLAY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP \
+            XDG_SESSION_DESKTOP DESKTOP_SESSION XCURSOR_SIZE SWM_BIN >/dev/null 2>&1 || true
+    }
+    trap cleanup_dinit 0 INT TERM HUP
+
+    # Import the login environment into the user manager. Environment variable
+    # names containing newlines are intentionally unsupported.
+    awk 'BEGIN { for (name in ENVIRON) if (name != "AWKPATH" && name != "AWKLIBPATH") print name }' \
+        2>/dev/null | xargs dinitctl --quiet --user setenv 2>/dev/null || true
+    sync_dbus_environment
+    mkdir -p "$HOME/.local/state/swm"
+
+    if ! dinitctl --quiet --user start swm.target; then
+        echo 'Failed to start swm.target with the dinit user manager.' >&2
+        exit 1
+    fi
+
+    # Keep the display-manager session alive until the compositor stops. The
+    # callback terminates dinit-monitor only for stopped/failed transitions.
+    dinit-monitor --user --initial \
+        -c 'sh -c '\''case "$1" in stopped|failed) kill "$PPID" ;; esac'\'' sh "%s"' \
+        swm >/dev/null 2>&1
+    if dinitctl --quiet --user is-failed swm 2>/dev/null; then
+        status=1
+    else
+        status=0
+    fi
+    cleanup_dinit
+    exit "$status"
+fi
+
+# OpenRC, runit, s6, and sessions without a user manager use the compositor as
+# the session process. swm still publishes its Wayland environment to D-Bus.
+exec "$SWM_BIN" --session "$@"

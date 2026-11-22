@@ -1,0 +1,470 @@
+use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::ffi::OsString;
+#[cfg(feature = "dinit")]
+use std::fs::File;
+#[cfg(feature = "dinit")]
+use std::io::Write as _;
+#[cfg(feature = "dinit")]
+use std::os::fd::FromRawFd;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static DIRECT_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+const SESSION_CLEANUP_VARIABLES: [&str; 8] = [
+    "WAYLAND_DISPLAY",
+    "DISPLAY",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_DESKTOP",
+    "XDG_SESSION_TYPE",
+    "DESKTOP_SESSION",
+    "XCURSOR_SIZE",
+    "XCURSOR_THEME",
+];
+
+/// A native compositor launched without a session wrapper owns cleanup too.
+pub struct NativeSession;
+
+impl Drop for NativeSession {
+    fn drop(&mut self) {
+        shutdown_session();
+    }
+}
+
+/// Stop session services while the compositor still owns a working display.
+/// Drop remains a fallback for initialization failures and unwinding.
+pub fn shutdown_session() {
+    if !DIRECT_SESSION_ACTIVE.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let mut shutdown = Command::new("systemctl");
+    shutdown.args([
+        "--user",
+        "start",
+        "--job-mode=replace-irreversibly",
+        "swm-shutdown.target",
+    ]);
+    if !run("direct session shutdown", &mut shutdown) {
+        let mut stop = Command::new("systemctl");
+        stop.args([
+            "--user",
+            "stop",
+            "swm-direct-session.target",
+            "graphical-session.target",
+            "graphical-session-pre.target",
+        ]);
+        run("direct session target cleanup", &mut stop);
+    }
+    let mut clear = Command::new("systemctl");
+    clear.args(["--user", "unset-environment"]);
+    clear.args(SESSION_CLEANUP_VARIABLES);
+    run("direct session environment cleanup", &mut clear);
+}
+
+fn launcher_owns_session() -> bool {
+    std::env::var_os("SWM_SESSION_LAUNCHER_ACTIVE").as_deref() == Some(OsStr::new("1"))
+        || (std::env::var_os("MANAGERPID").is_some()
+            && std::env::var("SYSTEMD_EXEC_PID")
+                .is_ok_and(|pid| pid == std::process::id().to_string()))
+}
+
+fn init_integration_enabled() -> bool {
+    !matches!(
+        std::env::var("SWM_NO_INIT_INTEGRATION").as_deref(),
+        Ok("1" | "true" | "yes" | "on")
+    )
+}
+
+const SESSION_VARIABLES: [&str; 6] = [
+    "WAYLAND_DISPLAY",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_DESKTOP",
+    "XDG_SESSION_TYPE",
+    "DESKTOP_SESSION",
+    "PATH",
+];
+
+/// Effective environment overrides for every process launched by SWM.
+///
+/// Reloads merge rather than replace, so removing a key from config does not
+/// unset it until restart.
+#[derive(Clone, Debug, Default)]
+pub(super) struct LaunchEnvironment {
+    values: BTreeMap<String, String>,
+}
+
+impl LaunchEnvironment {
+    pub fn new(values: &BTreeMap<String, String>) -> Self {
+        Self {
+            values: values.clone(),
+        }
+    }
+
+    pub fn reload(&mut self, values: &BTreeMap<String, String>) {
+        self.values.extend(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+    }
+
+    /// The cursor section is authoritative over inherited and env-block values.
+    pub fn set_cursor_theme(&mut self, theme: &str) {
+        self.values
+            .insert("XCURSOR_THEME".to_string(), theme.to_string());
+    }
+
+    pub fn apply_to(&self, command: &mut Command) {
+        command.envs(&self.values);
+    }
+
+    #[cfg(any(feature = "xwayland", feature = "dbus", test))]
+    pub fn iter(&self) -> impl Iterator<Item = (&OsStr, &OsStr)> {
+        self.values
+            .iter()
+            .map(|(key, value)| (OsStr::new(key), OsStr::new(value)))
+    }
+
+    pub fn path(&self) -> Option<OsString> {
+        self.values
+            .get("PATH")
+            .map(OsString::from)
+            .or_else(|| std::env::var_os("PATH"))
+    }
+}
+
+/// Establishes the environment that selects the real session backend.
+///
+/// This runs before any worker threads exist. Removing inherited display
+/// variables is what prevents a display-manager environment from making a
+/// full login accidentally choose the nested backend.
+pub fn prepare_session() {
+    unsafe {
+        std::env::set_var("XDG_CURRENT_DESKTOP", "SWM");
+        std::env::set_var("XDG_SESSION_DESKTOP", "SWM");
+        std::env::set_var("XDG_SESSION_TYPE", "wayland");
+        std::env::set_var("DESKTOP_SESSION", "SWM");
+        std::env::remove_var("DISPLAY");
+        std::env::remove_var("WAYLAND_DISPLAY");
+        std::env::remove_var("WAYLAND_SOCKET");
+    }
+}
+
+/// Publish a usable compositor socket before starting graphical services.
+pub fn activate_session(wayland_display: &OsStr, cursor_theme: &str, cursor_size: u8) {
+    unsafe {
+        std::env::set_var("WAYLAND_DISPLAY", wayland_display);
+    }
+
+    let systemd_integration = systemd_integration_enabled();
+    let mut dbus = Command::new("dbus-update-activation-environment");
+    if systemd_integration {
+        dbus.arg("--systemd");
+    }
+    dbus.args(SESSION_VARIABLES);
+    run("dbus activation environment", &mut dbus);
+
+    if systemd_integration {
+        let mut import = Command::new("systemctl");
+        import
+            .arg("--user")
+            .arg("import-environment")
+            .args(SESSION_VARIABLES);
+        run("systemd user environment", &mut import);
+    } else if !systemd_is_enabled() && init_integration_enabled() {
+        publish_dinit_variables(&SESSION_VARIABLES);
+    }
+    publish_cursor_settings(cursor_theme, cursor_size);
+}
+
+/// Refresh portal services only after announcing a usable graphical session.
+pub fn refresh_portals() {
+    if !systemd_integration_enabled() {
+        return;
+    }
+    // A portal backend may have exhausted its start limit while the
+    // compositor socket was unavailable. Clear that stale failure after
+    // publishing the complete environment so the frontend can activate
+    // it immediately.
+    let mut reset_failed = Command::new("systemctl");
+    reset_failed
+        .arg("--user")
+        .arg("reset-failed")
+        .arg("xdg-desktop-portal-gtk.service");
+    run_optional("portal failure reset", &mut reset_failed);
+
+    let mut restart = Command::new("systemctl");
+    restart
+        .arg("--user")
+        .arg("restart")
+        .arg("--no-block")
+        .arg("xdg-desktop-portal.service");
+    run("portal refresh", &mut restart);
+}
+
+/// Updates cursor settings for applications activated after a config reload.
+/// Existing processes retain their launch environment.
+pub fn publish_cursor_settings(cursor_theme: &str, cursor_size: u8) {
+    let assignments = cursor_assignments(cursor_theme, cursor_size);
+    let systemd_integration = systemd_integration_enabled();
+    let mut dbus = Command::new("dbus-update-activation-environment");
+    if systemd_integration {
+        dbus.arg("--systemd");
+    }
+    dbus.args(&assignments);
+    run("cursor D-Bus environment", &mut dbus);
+
+    if systemd_integration {
+        let mut systemd = Command::new("systemctl");
+        systemd
+            .arg("--user")
+            .arg("set-environment")
+            .args(&assignments);
+        run("cursor systemd environment", &mut systemd);
+    } else if !systemd_is_enabled() && init_integration_enabled() {
+        publish_dinit_assignments(&assignments);
+    }
+}
+
+#[cfg(feature = "xwayland")]
+pub fn activate_xwayland(display: &OsStr) {
+    let mut assignment = OsString::from("DISPLAY=");
+    assignment.push(display);
+    let systemd_integration = systemd_integration_enabled();
+
+    let mut dbus = Command::new("dbus-update-activation-environment");
+    if systemd_integration {
+        dbus.arg("--systemd");
+    }
+    dbus.arg(&assignment);
+    run("XWayland D-Bus environment", &mut dbus);
+
+    if systemd_integration {
+        let mut systemd = Command::new("systemctl");
+        systemd
+            .arg("--user")
+            .arg("set-environment")
+            .arg(&assignment);
+        run("XWayland systemd environment", &mut systemd);
+    } else if !systemd_is_enabled() && init_integration_enabled() {
+        publish_dinit_assignments(std::slice::from_ref(&assignment));
+    }
+}
+
+fn systemd_is_enabled() -> bool {
+    cfg!(feature = "systemd") && Path::new("/run/systemd/system").is_dir()
+}
+
+fn systemd_integration_enabled() -> bool {
+    systemd_is_enabled() && init_integration_enabled()
+}
+
+#[cfg(feature = "dinit")]
+fn publish_dinit_variables(variables: &[&str]) {
+    if systemd_is_enabled() {
+        return;
+    }
+    let mut command = Command::new("dinitctl");
+    command
+        .arg("--quiet")
+        .arg("--user")
+        .arg("setenv")
+        .args(variables);
+    run_optional("dinit user environment", &mut command);
+}
+
+#[cfg(not(feature = "dinit"))]
+fn publish_dinit_variables(_variables: &[&str]) {}
+
+#[cfg(feature = "dinit")]
+fn publish_dinit_assignments(assignments: &[OsString]) {
+    if systemd_is_enabled() {
+        return;
+    }
+    let mut command = Command::new("dinitctl");
+    command
+        .arg("--quiet")
+        .arg("--user")
+        .arg("setenv")
+        .args(assignments);
+    run_optional("dinit user environment", &mut command);
+}
+
+#[cfg(not(feature = "dinit"))]
+fn publish_dinit_assignments(_assignments: &[OsString]) {}
+
+/// Announces that the compositor's Wayland and IPC listeners are usable.
+pub fn notify_ready() {
+    #[cfg(feature = "systemd")]
+    if let Err(err) = sd_notify::notify(&[sd_notify::NotifyState::Ready]) {
+        eventline::warn!("systemd readiness notification failed: {err}");
+    }
+    if systemd_is_enabled() && init_integration_enabled() && !launcher_owns_session() {
+        // Enqueue rather than wait: services may connect to Wayland before
+        // this function returns and the compositor begins dispatching events.
+        let mut start = Command::new("systemctl");
+        // graphical-session.target refuses direct starts. Pull it in through
+        // our own target, without starting swm.service a second time.
+        start.args(["--user", "start", "--no-block", "swm-direct-session.target"]);
+        DIRECT_SESSION_ACTIVE.store(
+            run("direct graphical session", &mut start),
+            Ordering::SeqCst,
+        );
+    }
+
+    #[cfg(feature = "dinit")]
+    if let Err(err) = notify_dinit_ready() {
+        eventline::warn!("dinit readiness notification failed: {err}");
+    }
+}
+
+#[cfg(feature = "dinit")]
+fn notify_dinit_ready() -> Result<(), Box<dyn std::error::Error>> {
+    let fd = match std::env::var("NOTIFY_FD") {
+        Ok(value) => value.parse::<i32>()?,
+        Err(std::env::VarError::NotPresent) => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    if fd < 0 {
+        return Err("NOTIFY_FD must be non-negative".into());
+    }
+    // SAFETY: dinit gives the service ownership of this readiness pipe. Taking
+    // it as a File writes the one readiness record and closes our copy.
+    let mut pipe = unsafe { File::from_raw_fd(fd) };
+    pipe.write_all(b"READY=1\n")?;
+    Ok(())
+}
+
+const MAX_HELPER_DETAIL_BYTES: usize = 4096;
+
+fn helper_output(command: &mut Command) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let mut stderr = child.stderr.take().expect("helper stderr was piped");
+    // Drain concurrently so a verbose failure cannot fill the pipe and stall
+    // the helper. Retain only the diagnostic prefix plus a truncation marker.
+    let reader = match std::thread::Builder::new()
+        .name("swm helper stderr".into())
+        .spawn(move || -> std::io::Result<Vec<u8>> {
+            let mut detail = Vec::with_capacity(MAX_HELPER_DETAIL_BYTES + 1);
+            let mut buffer = [0u8; 4096];
+            loop {
+                match stderr.read(&mut buffer) {
+                    Ok(0) => return Ok(detail),
+                    Ok(length) => {
+                        let retained = length.min(MAX_HELPER_DETAIL_BYTES + 1 - detail.len());
+                        detail.extend_from_slice(&buffer[..retained]);
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(err) => return Err(err),
+                }
+            }
+        }) {
+        Ok(reader) => reader,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
+    };
+    let status = child.wait();
+    let stderr = reader
+        .join()
+        .map_err(|_| std::io::Error::other("helper stderr reader panicked"))??;
+    Ok(std::process::Output {
+        status: status?,
+        stdout: Vec::new(),
+        stderr,
+    })
+}
+
+fn run(label: &str, command: &mut Command) -> bool {
+    match helper_output(command) {
+        Ok(output) if output.status.success() => {
+            eventline::debug!("{label}: complete");
+            true
+        }
+        Ok(output) => {
+            eventline::warn!(
+                "{label}: exited with {}{}",
+                output.status,
+                helper_error_detail(&output.stderr)
+            );
+            false
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            eventline::debug!("{label}: helper unavailable");
+            false
+        }
+        Err(err) => {
+            eventline::warn!("{label}: {err}");
+            false
+        }
+    }
+}
+
+/// Runs best-effort integration cleanup where a missing/inactive optional
+/// desktop component is an expected state, not a compositor warning.
+fn run_optional(label: &str, command: &mut Command) {
+    match helper_output(command) {
+        Ok(output) if output.status.success() => eventline::debug!("{label}: complete"),
+        Ok(output) => eventline::debug!(
+            "{label}: optional helper exited with {}{}",
+            output.status,
+            helper_error_detail(&output.stderr)
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            eventline::debug!("{label}: helper unavailable")
+        }
+        Err(err) => eventline::warn!("{label}: {err}"),
+    }
+}
+
+fn helper_error_detail(stderr: &[u8]) -> String {
+    let end = stderr.len().min(MAX_HELPER_DETAIL_BYTES);
+    let detail = String::from_utf8_lossy(&stderr[..end])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if detail.is_empty() {
+        return String::new();
+    }
+    format!(
+        ": {detail}{}",
+        if stderr.len() > end {
+            " [truncated]"
+        } else {
+            ""
+        }
+    )
+}
+
+fn cursor_assignments(cursor_theme: &str, cursor_size: u8) -> [OsString; 2] {
+    [
+        OsString::from(format!("XCURSOR_THEME={cursor_theme}")),
+        OsString::from(format!("XCURSOR_SIZE={cursor_size}")),
+    ]
+}
+
+#[cfg(test)]
+mod iter_tests {
+    use super::*;
+
+    #[test]
+    fn iter_yields_configured_variables() {
+        let mut env = LaunchEnvironment::new(&BTreeMap::from([("A".into(), "1".into())]));
+        env.set_cursor_theme("Adwaita");
+        let entries: BTreeMap<_, _> = env.iter().collect();
+        assert_eq!(entries.get(OsStr::new("A")), Some(&OsStr::new("1")));
+        assert_eq!(
+            entries.get(OsStr::new("XCURSOR_THEME")),
+            Some(&OsStr::new("Adwaita"))
+        );
+    }
+}

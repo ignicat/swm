@@ -1,0 +1,10 @@
+/target/
+/dist/
+result
+result-*
+.direnv/
+*.swp
+*~
+.DS_Store
+__pycache__/
+*.py[cod]

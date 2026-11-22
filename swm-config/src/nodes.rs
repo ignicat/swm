@@ -1,0 +1,410 @@
+use std::fmt;
+
+use rune_cfg::RuneConfig;
+use rune_cfg::ast::{ObjectItem, Value};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Decay {
+    pub enabled: bool,
+    /// How long a window must stay entirely off screen before it collapses.
+    pub delay_seconds: u64,
+}
+
+impl Default for Decay {
+    /// Automatic decay is opt-in. Once enabled, a window collapses after
+    /// 10 minutes entirely off screen; windows you can see never decay.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            delay_seconds: 600,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NodeShape {
+    Square,
+    #[default]
+    Squircle,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NodeDisplayPolicy {
+    Off,
+    Hover,
+    #[default]
+    Always,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RestoreCentering {
+    #[default]
+    Never,
+    IfOffscreen,
+    Always,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum NodeBackgroundColor {
+    #[default]
+    Auto,
+    System,
+    Light,
+    Dark,
+    Fixed(f32, f32, f32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Nodes {
+    pub shape: NodeShape,
+    pub label_shape: NodeShape,
+    pub show_labels: NodeDisplayPolicy,
+    pub show_app_icons: NodeDisplayPolicy,
+    pub icon_size: f32,
+    pub opacity: f32,
+    pub restore_centering: RestoreCentering,
+    pub background_color: NodeBackgroundColor,
+    pub border_color: crate::BorderColor,
+    pub border_color_highlighted: crate::BorderColor,
+}
+
+impl Default for Nodes {
+    fn default() -> Self {
+        Self {
+            shape: NodeShape::Squircle,
+            label_shape: NodeShape::Squircle,
+            show_labels: NodeDisplayPolicy::Hover,
+            show_app_icons: NodeDisplayPolicy::Always,
+            icon_size: 0.72,
+            opacity: 1.0,
+            restore_centering: RestoreCentering::Never,
+            background_color: NodeBackgroundColor::Auto,
+            border_color: crate::BorderColor {
+                r: 0x47 as f32 / 255.0,
+                g: 0x4d as f32 / 255.0,
+                b: 0x59 as f32 / 255.0,
+            },
+            border_color_highlighted: crate::BorderColor {
+                r: 0xd6 as f32 / 255.0,
+                g: 0x5d as f32 / 255.0,
+                b: 0x26 as f32 / 255.0,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LandmarkPlacement {
+    pub gap_px: f32,
+}
+
+impl Nodes {
+    pub fn resolved_for_system(mut self, scheme: crate::SystemColorScheme) -> Self {
+        if self.background_color == NodeBackgroundColor::System {
+            self.background_color = match scheme {
+                crate::SystemColorScheme::PreferDark => NodeBackgroundColor::Dark,
+                crate::SystemColorScheme::PreferLight => NodeBackgroundColor::Light,
+                crate::SystemColorScheme::NoPreference => NodeBackgroundColor::Auto,
+            };
+        }
+        self
+    }
+}
+
+impl Default for LandmarkPlacement {
+    fn default() -> Self {
+        Self { gap_px: 20.0 }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Debug {
+    /// Suppress linux-drm-syncobj-v1 advertisement for the entire session.
+    /// This startup-only workaround does not change on configuration reload.
+    pub disable_explicit_sync: bool,
+}
+
+pub fn parse_decay(config: &RuneConfig) -> Decay {
+    let defaults = Decay::default();
+    Decay {
+        enabled: config.get_or("decay.enabled", defaults.enabled),
+        delay_seconds: crate::aliases::lookup::<u64>(config, "decay.delay-seconds")
+            .ok()
+            .flatten()
+            .unwrap_or(defaults.delay_seconds)
+            .max(1),
+    }
+}
+
+fn parse_nodes(config: &RuneConfig) -> Nodes {
+    let defaults = Nodes::default();
+    Nodes {
+        shape: parse_shape(config, "node.shape", defaults.shape),
+        label_shape: parse_shape(config, "node.label-shape", defaults.label_shape),
+        show_labels: parse_display_policy(config, "node.show-labels", defaults.show_labels),
+        show_app_icons: parse_display_policy(
+            config,
+            "node.show-app-icons",
+            defaults.show_app_icons,
+        ),
+        icon_size: finite_clamp(
+            config.get_or("node.icon-size", defaults.icon_size),
+            0.1,
+            1.0,
+            defaults.icon_size,
+        ),
+        opacity: finite_clamp(
+            config.get_or("node.opacity", defaults.opacity),
+            0.0,
+            1.0,
+            defaults.opacity,
+        ),
+        restore_centering: config
+            .get_optional::<String>("node.click-collapsed-pan")
+            .ok()
+            .flatten()
+            .or_else(|| {
+                config
+                    .get_optional::<String>("node.restore-centering")
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|value| match value.as_str() {
+                "never" => Some(RestoreCentering::Never),
+                "if-offscreen" | "if_offscreen" => Some(RestoreCentering::IfOffscreen),
+                "always" => Some(RestoreCentering::Always),
+                _ => None,
+            })
+            .unwrap_or(defaults.restore_centering),
+        background_color: parse_background_color(config, defaults.background_color),
+        border_color: parse_node_color(config, "node.border-colour", defaults.border_color),
+        border_color_highlighted: parse_node_color(
+            config,
+            "node.border-colour-highlighted",
+            defaults.border_color_highlighted,
+        ),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeParseError(String);
+
+impl fmt::Display for NodeParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NodeParseError {}
+
+pub fn parse_nodes_checked(config: &RuneConfig) -> Result<Nodes, NodeParseError> {
+    let Value::Object(root) = config
+        .get_value("")
+        .map_err(|error| NodeParseError(format!("node config: {error}")))?
+    else {
+        return Err(NodeParseError(
+            "node config root must be an object".to_string(),
+        ));
+    };
+    for fields in root.iter().filter_map(|item| match item {
+        ObjectItem::Assign(key, Value::Object(fields)) if key == "node" => Some(fields),
+        _ => None,
+    }) {
+        for (removed, replacement) in [
+            ("node-shape", "shape"),
+            ("node_shape", "shape"),
+            ("node-label-shape", "label-shape"),
+            ("node_label_shape", "label-shape"),
+            ("label_shape", "label-shape"),
+        ] {
+            if object_field(fields, &[removed]).is_some() {
+                return Err(NodeParseError(format!(
+                    "node.{removed} was removed; use node.{replacement}"
+                )));
+            }
+        }
+    }
+    Ok(parse_nodes(config))
+}
+
+pub fn parse_debug(config: &RuneConfig) -> Debug {
+    Debug {
+        disable_explicit_sync: config.get_or("debug.disable-explicit-sync", false),
+    }
+}
+
+fn parse_shape(config: &RuneConfig, path: &str, default: NodeShape) -> NodeShape {
+    config
+        .get_optional::<String>(path)
+        .ok()
+        .flatten()
+        .and_then(|value| match value.as_str() {
+            "square" => Some(NodeShape::Square),
+            "squircle" => Some(NodeShape::Squircle),
+            _ => None,
+        })
+        .unwrap_or(default)
+}
+
+fn parse_background_color(
+    config: &RuneConfig,
+    default: NodeBackgroundColor,
+) -> NodeBackgroundColor {
+    let Some(value) = config
+        .get_optional::<String>("node.background-colour")
+        .ok()
+        .flatten()
+    else {
+        return default;
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "auto" | "theme" => NodeBackgroundColor::Auto,
+        "system" => NodeBackgroundColor::System,
+        "light" => NodeBackgroundColor::Light,
+        "dark" => NodeBackgroundColor::Dark,
+        _ => crate::color::parse_hex_rgb(&value)
+            .map(|[r, g, b]| NodeBackgroundColor::Fixed(r, g, b))
+            .unwrap_or(default),
+    }
+}
+
+fn parse_node_color(
+    config: &RuneConfig,
+    key: &str,
+    default: crate::BorderColor,
+) -> crate::BorderColor {
+    let value = crate::aliases::spellings(key)
+        .iter()
+        .find_map(|path| config.get_optional::<String>(path).ok().flatten());
+    let Some(value) = value else {
+        return default;
+    };
+    crate::color::parse_hex_rgb(&value)
+        .map(|[r, g, b]| crate::BorderColor { r, g, b })
+        .unwrap_or(default)
+}
+
+fn object_field<'a>(fields: &'a [ObjectItem], names: &[&str]) -> Option<&'a Value> {
+    fields.iter().find_map(|item| match item {
+        ObjectItem::Assign(key, value) if names.contains(&key.as_str()) => Some(value),
+        _ => None,
+    })
+}
+
+fn parse_display_policy(
+    config: &RuneConfig,
+    path: &str,
+    default: NodeDisplayPolicy,
+) -> NodeDisplayPolicy {
+    config
+        .get_optional::<String>(path)
+        .ok()
+        .flatten()
+        .and_then(|value| match value.as_str() {
+            "off" => Some(NodeDisplayPolicy::Off),
+            "hover" => Some(NodeDisplayPolicy::Hover),
+            "always" => Some(NodeDisplayPolicy::Always),
+            _ => None,
+        })
+        .unwrap_or(default)
+}
+
+fn finite_clamp(value: f32, min: f32, max: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        fallback
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decay_is_off_by_default_with_one_off_screen_delay() {
+        let decay = parse_decay(&RuneConfig::from_str("").unwrap());
+        assert!(!decay.enabled);
+        assert_eq!(decay.delay_seconds, 600);
+
+        let config =
+            RuneConfig::from_str("decay:\n  enabled true\n  delay-seconds 120\nend\n").unwrap();
+        assert_eq!(
+            parse_decay(&config),
+            Decay {
+                enabled: true,
+                delay_seconds: 120,
+            }
+        );
+    }
+
+    #[test]
+    fn decay_reads_the_old_outside_delay_and_ignores_the_inside_delay() {
+        let config = RuneConfig::from_str(
+            "decay:\n  outside-delay-seconds 45\n  inside-delay-seconds 90\nend\n",
+        )
+        .unwrap();
+        assert_eq!(parse_decay(&config).delay_seconds, 45);
+
+        let both =
+            RuneConfig::from_str("decay:\n  outside-delay-seconds 45\n  delay-seconds 30\nend\n")
+                .unwrap();
+        assert_eq!(parse_decay(&both).delay_seconds, 30);
+    }
+
+    #[test]
+    fn explicit_sync_opt_out_is_disabled_by_default_and_accepts_both_values() {
+        for (source, disabled) in [
+            ("", false),
+            ("debug:\n  disable-explicit-sync false\nend\n", false),
+            ("debug:\n  disable-explicit-sync true\nend\n", true),
+        ] {
+            let config = RuneConfig::from_str(source).unwrap();
+            assert_eq!(parse_debug(&config).disable_explicit_sync, disabled);
+        }
+    }
+
+    #[test]
+    fn parses_canonical_node_names_and_landmark_gap() {
+        let config = RuneConfig::from_str(
+            r##"
+field:
+  gap-px 24
+end
+node:
+  shape "square"
+  label-shape "square"
+  background-colour "#102030"
+  border-colour "#112233"
+  border-color-highlighted "#aabbcc"
+  click-collapsed-pan "always"
+end
+"##,
+        )
+        .unwrap();
+        let nodes = parse_nodes_checked(&config).unwrap();
+        assert_eq!(nodes.shape, NodeShape::Square);
+        assert_eq!(nodes.label_shape, NodeShape::Square);
+        assert_eq!(nodes.restore_centering, RestoreCentering::Always);
+        assert!(matches!(
+            nodes.background_color,
+            NodeBackgroundColor::Fixed(_, _, _)
+        ));
+        assert_eq!(
+            nodes.border_color,
+            crate::BorderColor {
+                r: 0x11 as f32 / 255.0,
+                g: 0x22 as f32 / 255.0,
+                b: 0x33 as f32 / 255.0,
+            }
+        );
+        assert_eq!(
+            nodes.border_color_highlighted,
+            crate::BorderColor {
+                r: 0xaa as f32 / 255.0,
+                g: 0xbb as f32 / 255.0,
+                b: 0xcc as f32 / 255.0,
+            }
+        );
+    }
+}

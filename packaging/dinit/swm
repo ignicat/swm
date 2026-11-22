@@ -1,0 +1,7 @@
+type               = process
+command            = /usr/bin/swm --session
+restart            = false
+working-dir        = $HOME
+ready-notification = pipevar:NOTIFY_FD
+logfile            = $HOME/.local/state/swm/swm.log
+depends-on:        dbus

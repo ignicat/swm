@@ -1,0 +1,1400 @@
+use smithay::backend::input::{
+    AbsolutePositionEvent, Axis, AxisSource, InputBackend, InputEvent, PointerAxisEvent,
+    PointerMotionEvent,
+};
+use smithay::desktop::space::SpaceElement;
+use smithay::desktop::{LayerSurface, Space, Window, WindowSurfaceType, layer_map_for_output};
+use smithay::input::pointer::AxisFrame;
+use smithay::output::Output;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::utils::{Logical, Point, Rectangle};
+use smithay::wayland::compositor::{RegionAttributes, SurfaceAttributes, with_states};
+use smithay::wayland::seat::WaylandFocus;
+use smithay::wayland::shell::wlr_layer::Layer;
+
+use crate::input::keybinds::WheelDirection;
+use crate::presentation::camera::OutputCameras;
+use crate::presentation::window::WindowPresentation;
+
+#[derive(Debug)]
+pub enum PointerTarget {
+    Layer(LayerSurface),
+    Window(Window),
+    Decoration {
+        window: Window,
+        hit: crate::window_chrome::Hit,
+    },
+    Background,
+}
+
+pub type SurfaceFocus = (WlSurface, Point<f64, Logical>);
+type LayerHit = (LayerSurface, SurfaceFocus);
+
+/// A pointer route in the coordinate system used by its focused surface.
+///
+/// Camera-transformed windows use world coordinates so their client-local
+/// position remains unscaled. Screen-fixed layer surfaces use global output
+/// layout coordinates. In both cases `location` and the focus origin share
+/// one coordinate system, which is Smithay's required invariant.
+#[derive(Debug)]
+pub struct PointerRoute {
+    pub output: Output,
+    pub location: Point<f64, Logical>,
+    pub focus: Option<SurfaceFocus>,
+    pub target: PointerTarget,
+    pub visual_geometry: Option<Rectangle<i32, Logical>>,
+    /// True when this route landed in a client popup promoted above the desktop
+    /// top layer. Desktop landmarks must not intercept that promoted surface.
+    pub is_desktop_popup: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowHitKind {
+    Popup,
+    Any,
+}
+
+#[derive(Clone, Copy)]
+pub struct PointerRoutingContext<'a> {
+    pub space: &'a Space<Window>,
+    pub cameras: &'a OutputCameras,
+    pub nodes: &'a crate::nodes::NodesState,
+    pub window_animations: &'a crate::animation::WindowAnimations,
+    pub primary: &'a Output,
+    pub fullscreen: &'a crate::wayland::fullscreen::FullscreenManager,
+    pub maximize: &'a crate::presentation::maximize::FieldMaximizeManager,
+    pub decorations: &'a swm_config::Decorations,
+    pub focused: Option<&'a WlSurface>,
+    pub now: std::time::Duration,
+}
+
+/// Screen-space cursor tracking. Client-facing focus, buttons, implicit
+/// grabs, and axes are owned by Smithay's `PointerHandle`; this type only
+/// tracks where SWM draws the hardware/software cursor.
+pub struct Pointer {
+    position: (f64, f64),
+}
+
+const WHEEL_V120_PER_TICK: f64 = 120.0;
+
+/// Accumulates high-resolution physical wheel deltas into discrete notches.
+/// Each axis is independent, and reversing direction drops the unfinished
+/// fraction from the previous direction.
+#[derive(Debug, Default)]
+pub struct WheelAccumulator {
+    horizontal: f64,
+    vertical: f64,
+}
+
+impl WheelAccumulator {
+    pub fn accumulate(&mut self, axis: Axis, delta_v120: f64) -> i32 {
+        let pending = match axis {
+            Axis::Horizontal => &mut self.horizontal,
+            Axis::Vertical => &mut self.vertical,
+        };
+        if *pending != 0.0 && delta_v120 != 0.0 && pending.signum() != delta_v120.signum() {
+            *pending = 0.0;
+        }
+        *pending += delta_v120;
+        let ticks = (*pending / WHEEL_V120_PER_TICK).trunc() as i32;
+        *pending -= f64::from(ticks) * WHEEL_V120_PER_TICK;
+        ticks
+    }
+
+    pub fn reset(&mut self, axis: Axis) {
+        match axis {
+            Axis::Horizontal => self.horizontal = 0.0,
+            Axis::Vertical => self.vertical = 0.0,
+        }
+    }
+
+    pub fn reset_all(&mut self) {
+        self.horizontal = 0.0;
+        self.vertical = 0.0;
+    }
+}
+
+fn wheel_delta_v120<B, E>(event: &E, axis: Axis) -> f64
+where
+    B: InputBackend,
+    E: PointerAxisEvent<B>,
+{
+    event
+        .amount_v120(axis)
+        .or_else(|| {
+            event
+                .amount(axis)
+                .map(|amount| amount * WHEEL_V120_PER_TICK / 15.0)
+        })
+        .unwrap_or(0.0)
+}
+
+fn wheel_direction(axis: Axis, delta_v120: f64) -> Option<WheelDirection> {
+    match (axis, delta_v120.total_cmp(&0.0)) {
+        (_, std::cmp::Ordering::Equal) => None,
+        (Axis::Horizontal, std::cmp::Ordering::Less) => Some(WheelDirection::Left),
+        (Axis::Horizontal, std::cmp::Ordering::Greater) => Some(WheelDirection::Right),
+        (Axis::Vertical, std::cmp::Ordering::Less) => Some(WheelDirection::Up),
+        (Axis::Vertical, std::cmp::Ordering::Greater) => Some(WheelDirection::Down),
+    }
+}
+
+/// Backend-independent result of applying configured wheel bindings to one
+/// axis event. Sessions execute the returned actions and forward only the
+/// axes left enabled here.
+pub struct WheelBindingResult<T> {
+    pub forward_horizontal: bool,
+    pub forward_vertical: bool,
+    pub actions: Vec<(WheelDirection, T)>,
+}
+
+impl<T> Default for WheelBindingResult<T> {
+    fn default() -> Self {
+        Self {
+            forward_horizontal: true,
+            forward_vertical: true,
+            actions: Vec::new(),
+        }
+    }
+}
+
+/// Applies physical-wheel source filtering, direction matching, high-
+/// resolution accumulation, and per-axis forwarding policy in one place.
+/// The callback keeps this low-level policy independent of SWM's action
+/// type and bind-table representation.
+pub fn process_wheel_bindings<B, E, T, F>(
+    event: &E,
+    accumulator: &mut WheelAccumulator,
+    bindings_enabled: bool,
+    mut action_for_direction: F,
+) -> WheelBindingResult<T>
+where
+    B: InputBackend,
+    E: PointerAxisEvent<B>,
+    T: Clone,
+    F: FnMut(WheelDirection) -> Option<T>,
+{
+    let mut result = WheelBindingResult::default();
+    if event.source() != AxisSource::Wheel || !bindings_enabled {
+        accumulator.reset_all();
+        return result;
+    }
+
+    for axis in [Axis::Horizontal, Axis::Vertical] {
+        let delta = wheel_delta_v120(event, axis);
+        let Some(direction) = wheel_direction(axis, delta) else {
+            continue;
+        };
+        let Some(action) = action_for_direction(direction) else {
+            accumulator.reset(axis);
+            continue;
+        };
+
+        match axis {
+            Axis::Horizontal => result.forward_horizontal = false,
+            Axis::Vertical => result.forward_vertical = false,
+        }
+        let ticks = accumulator.accumulate(axis, delta);
+        for _ in 0..ticks.unsigned_abs() {
+            result.actions.push((direction, action.clone()));
+        }
+    }
+    result
+}
+
+impl Pointer {
+    pub fn new(initial: (f64, f64)) -> Self {
+        Self { position: initial }
+    }
+
+    pub fn position(&self) -> (f64, f64) {
+        self.position
+    }
+
+    pub fn set_position(&mut self, position: (f64, f64)) {
+        self.position = position;
+    }
+
+    /// Client hints and presentation-driven corrections must leave the
+    /// compositor cursor on a mapped output, just like physical motion.
+    pub fn set_position_on_outputs(
+        &mut self,
+        position: Point<f64, Logical>,
+        space: &Space<Window>,
+    ) -> Option<Point<f64, Logical>> {
+        if !position.x.is_finite() || !position.y.is_finite() {
+            return None;
+        }
+        let outputs: Vec<_> = space
+            .outputs()
+            .filter_map(|output| space.output_geometry(output))
+            .filter(|geometry| geometry.size.w > 0 && geometry.size.h > 0)
+            .collect();
+        if outputs.is_empty() {
+            return None;
+        }
+        self.position = clamp_to_outputs(position.into(), &outputs);
+        Some(self.position.into())
+    }
+
+    /// Absolute events (winit's host window mouse, or absolute-mode tty
+    /// devices like touchpads/tablets) set the position directly; relative
+    /// events (a typical tty/libinput mouse) accumulate a delta. Both are
+    /// kept in Smithay's global logical output-layout coordinates and
+    /// constrained to mapped output geometries.
+    pub fn process_input_event<I: InputBackend>(
+        &mut self,
+        event: &InputEvent<I>,
+        space: &Space<Window>,
+    ) {
+        if !matches!(
+            event,
+            InputEvent::PointerMotion { .. } | InputEvent::PointerMotionAbsolute { .. }
+        ) {
+            return;
+        }
+
+        let outputs: Vec<_> = space
+            .outputs()
+            .filter_map(|output| space.output_geometry(output))
+            .collect();
+
+        match event {
+            InputEvent::PointerMotion { event } => {
+                let delta = event.delta();
+                let position = Point::<f64, Logical>::from(self.position);
+                let scale = space
+                    .outputs()
+                    .find(|output| {
+                        space
+                            .output_geometry(output)
+                            .is_some_and(|geometry| geometry.to_f64().contains(position))
+                    })
+                    .map_or(1.0, |output| output.current_scale().fractional_scale());
+                self.position = constrain_relative_motion(
+                    self.position,
+                    (
+                        self.position.0 + delta.x / scale,
+                        self.position.1 + delta.y / scale,
+                    ),
+                    &outputs,
+                );
+            }
+            InputEvent::PointerMotionAbsolute { event } => {
+                let Some(bounds) = desktop_bounds(&outputs) else {
+                    return;
+                };
+                let pos = event.position_transformed(bounds.size) + bounds.loc.to_f64();
+                self.position = clamp_to_outputs((pos.x, pos.y), &outputs);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Finds the client surface visually under `screen_position`.
+///
+/// Window ownership is output-local, matching rendering and compositor grab
+/// hit-testing: a window assigned to another output cannot intercept input
+/// merely because its world-space geometry overlaps this camera's view.
+pub fn route_to_client(
+    context: PointerRoutingContext<'_>,
+    screen_position: (f64, f64),
+) -> Option<PointerRoute> {
+    let output = context.space.output_under(screen_position).next()?;
+    let output_geometry = context.space.output_geometry(output)?;
+    let screen_location = Point::<f64, Logical>::from(screen_position);
+    let output_local = screen_location - output_geometry.loc.to_f64();
+
+    if let Some((layer, focus)) =
+        layer_under(output, output_geometry.loc, output_local, [Layer::Overlay])
+    {
+        return Some(PointerRoute {
+            output: output.clone(),
+            location: screen_location,
+            focus: Some(focus),
+            target: PointerTarget::Layer(layer),
+            visual_geometry: None,
+            is_desktop_popup: false,
+        });
+    }
+
+    // Window popup trees occupy the plane immediately below overlay surfaces
+    // and above Layer::Top. Route them in the same order in which they render.
+    if let Some(route) = window_under(&context, output, output_local, WindowHitKind::Popup) {
+        return Some(route);
+    }
+
+    if !context
+        .fullscreen
+        .covers_top_matching(context.focused, output, context.now, |_| true)
+        && let Some((layer, focus)) =
+            layer_under(output, output_geometry.loc, output_local, [Layer::Top])
+    {
+        return Some(PointerRoute {
+            output: output.clone(),
+            location: screen_location,
+            focus: Some(focus),
+            target: PointerTarget::Layer(layer),
+            visual_geometry: None,
+            is_desktop_popup: false,
+        });
+    }
+
+    if let Some(route) = window_under(&context, output, output_local, WindowHitKind::Any) {
+        return Some(route);
+    }
+
+    let camera = context.cameras.get(&output.name())?;
+    let world =
+        crate::input::grab::screen_to_world_on_output(screen_position, camera, output_geometry);
+    let location = Point::<f64, Logical>::from((world.x as f64, world.y as f64));
+
+    if let Some((layer, focus)) = layer_under(
+        output,
+        output_geometry.loc,
+        output_local,
+        [Layer::Bottom, Layer::Background],
+    ) {
+        return Some(PointerRoute {
+            output: output.clone(),
+            location: screen_location,
+            focus: Some(focus),
+            target: PointerTarget::Layer(layer),
+            visual_geometry: None,
+            is_desktop_popup: false,
+        });
+    }
+
+    Some(PointerRoute {
+        output: output.clone(),
+        location,
+        focus: None,
+        target: PointerTarget::Background,
+        visual_geometry: None,
+        is_desktop_popup: false,
+    })
+}
+
+fn layer_under(
+    output: &Output,
+    output_location: Point<i32, Logical>,
+    output_local: Point<f64, Logical>,
+    layers: impl IntoIterator<Item = Layer>,
+) -> Option<LayerHit> {
+    let map = layer_map_for_output(output);
+    for layer_kind in layers {
+        for layer in map.layers_on(layer_kind).rev() {
+            let Some(geometry) = map.layer_geometry(layer) else {
+                continue;
+            };
+            let Some((surface, surface_location)) =
+                layer.surface_under(output_local - geometry.loc.to_f64(), WindowSurfaceType::ALL)
+            else {
+                continue;
+            };
+            let origin = output_location + geometry.loc + surface_location;
+            return Some((layer.clone(), (surface, origin.to_f64())));
+        }
+    }
+    None
+}
+
+/// Resolves normal and fullscreen windows in one front-to-back pass.
+///
+/// Presentation transforms differ, but stacking order does not. A separate
+/// fullscreen-first pass lets a fullscreen surface underneath a newly
+/// raised normal window steal axes and clicks through that window.
+fn window_under(
+    context: &PointerRoutingContext<'_>,
+    output: &Output,
+    output_local: Point<f64, Logical>,
+    hit_kind: WindowHitKind,
+) -> Option<PointerRoute> {
+    let output_geometry = context.space.output_geometry(output)?;
+    let screen_position = (
+        output_geometry.loc.x as f64 + output_local.x,
+        output_geometry.loc.y as f64 + output_local.y,
+    );
+    let screen_location = Point::<f64, Logical>::from(screen_position);
+
+    let mut windows = context
+        .space
+        .elements()
+        .enumerate()
+        .filter_map(|(stack_index, window)| {
+            if !crate::wayland::window_is_on_output(window, output, context.primary) {
+                return None;
+            }
+            let presentation = WindowPresentation::for_window(
+                crate::presentation::window::WindowPresentationDesktop {
+                    space: context.space,
+                    cameras: context.cameras,
+                    window_animations: context.window_animations,
+                    fullscreen: context.fullscreen,
+                    maximize: context.maximize,
+                    decorations: context.decorations,
+                },
+                window,
+                output,
+                context.now,
+            )?;
+            Some((stack_index, window, presentation))
+        })
+        .collect::<Vec<_>>();
+    windows.sort_by_key(|(stack_index, _, _)| *stack_index);
+
+    crate::window::stacking::sort_above_parents(context.space, &mut windows, |(_, window, _)| {
+        Some(*window)
+    });
+
+    for (_, window, presentation) in windows.into_iter().rev() {
+        if !crate::wayland::window_is_on_output(window, output, context.primary) {
+            continue;
+        }
+        let visual_geometry = presentation.visual_geometry();
+        let surface = window.wl_surface();
+        let fullscreen = context.fullscreen.suppresses_window_chrome(window);
+        let chrome = crate::window_chrome::WindowChrome::for_window(window, context.decorations);
+        let chrome_visible = surface.as_ref().is_none_or(|surface| {
+            context
+                .fullscreen
+                .chrome_alpha(surface.as_ref(), context.now)
+                > 0.0
+        });
+        if hit_kind == WindowHitKind::Any && !fullscreen && chrome_visible {
+            let visual_scale = presentation.decoration_scale();
+            let border_width =
+                crate::window_chrome::scaled_metric(chrome.border_width, visual_scale);
+
+            let node = surface
+                .as_ref()
+                .and_then(|surface| context.nodes.id_for_surface(surface.as_ref()));
+            let border_resize_allowed = context.decorations.resize_using_border
+                && chrome.mode != crate::window_chrome::DecorationMode::Unmanaged
+                && crate::window::accepts_compositor_grab(window)
+                && surface.as_ref().is_none_or(|surface| {
+                    !context
+                        .fullscreen
+                        .is_fullscreen_or_pending(surface.as_ref())
+                        && !context.maximize.contains(surface.as_ref())
+                })
+                && node.is_none_or(|_| true);
+            let outer = crate::window_chrome::WindowChrome {
+                mode: chrome.mode,
+                border_width,
+            }
+            .outer_rect(visual_geometry);
+            if let Some(hit) = decoration_hit_at(
+                outer,
+                screen_location,
+                border_resize_allowed,
+                border_resize_band(border_width),
+            ) {
+                return Some(PointerRoute {
+                    output: output.clone(),
+                    location: presentation.source_from_screen(screen_location),
+                    focus: None,
+                    target: PointerTarget::Decoration {
+                        window: window.clone(),
+                        hit,
+                    },
+                    visual_geometry: Some(visual_geometry),
+                    is_desktop_popup: false,
+                });
+            }
+        }
+        if visual_bounds_required(hit_kind, crate::xwayland::is_x11(window))
+            && !presentation.contains_screen(screen_location)
+        {
+            continue;
+        }
+        let location = presentation.source_from_screen(screen_location);
+
+        let Some(element_location) = context.space.element_location(window) else {
+            continue;
+        };
+        let render_location = element_location - window.geometry().loc;
+        let surface_type = match hit_kind {
+            WindowHitKind::Popup if crate::xwayland::is_override_redirect(window) => {
+                WindowSurfaceType::ALL
+            }
+            WindowHitKind::Popup => WindowSurfaceType::POPUP | WindowSurfaceType::SUBSURFACE,
+            WindowHitKind::Any => WindowSurfaceType::ALL,
+        };
+        let Some(focus) = window_focus(window, location, render_location, surface_type) else {
+            continue;
+        };
+        return Some(PointerRoute {
+            output: output.clone(),
+            location,
+            focus: Some(focus),
+            target: PointerTarget::Window(window.clone()),
+            visual_geometry: Some(presentation.visual_geometry()),
+            is_desktop_popup: hit_kind == WindowHitKind::Popup,
+        });
+    }
+    None
+}
+
+fn visual_bounds_required(hit_kind: WindowHitKind, is_x11: bool) -> bool {
+    // Native popup trees perform their own surface-local hit testing and may
+    // legitimately extend beyond the toplevel's visual rectangle. X11
+    // override-redirect windows are independent surfaces. Retain this bounds
+    // gate as well as their surface-local input-region check below.
+    hit_kind == WindowHitKind::Any || is_x11
+}
+
+// Visible borders own their exact rendered width; borderless windows reserve
+// only a narrow content edge so nearby client controls remain clickable.
+fn border_resize_band(border_width: i32) -> f64 {
+    if border_width > 0 {
+        f64::from(border_width)
+    } else {
+        3.0
+    }
+}
+
+fn decoration_hit_at(
+    outer: Rectangle<i32, Logical>,
+    point: Point<f64, Logical>,
+    resize_allowed: bool,
+    resize_band: f64,
+) -> Option<crate::window_chrome::Hit> {
+    if resize_allowed {
+        crate::input::grab::border_resize_handle(outer, point, resize_band)
+            .map(crate::window_chrome::Hit::Resize)
+    } else {
+        None
+    }
+}
+
+/// Resolves the client surface under a window-local point.
+///
+/// Managed X11 windows retain the compatibility fast path: their input shape
+/// can lag compositor-owned geometry changes. Override-redirect windows are
+/// client-positioned, so honor the surface-local input shape XWayland supplies.
+/// Their transparent margins must not steal input from surfaces underneath.
+fn window_focus(
+    window: &Window,
+    location: Point<f64, Logical>,
+    render_location: Point<i32, Logical>,
+    surface_type: WindowSurfaceType,
+) -> Option<SurfaceFocus> {
+    let local = location - render_location.to_f64();
+    if crate::xwayland::is_x11(window) {
+        if !surface_type.contains(WindowSurfaceType::TOPLEVEL) {
+            return None;
+        }
+        let surface = window.wl_surface()?.into_owned();
+        if crate::xwayland::is_override_redirect(window)
+            && !with_states(&surface, |states| {
+                let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+                popup_input_region_contains(attributes.current().input_region.as_ref(), local)
+            })
+        {
+            return None;
+        }
+        return Some((surface, render_location.to_f64()));
+    }
+    if !window.is_in_input_region(&local) {
+        return None;
+    }
+    window
+        .surface_under(local, surface_type)
+        .map(|(surface, surface_location)| (surface, (surface_location + render_location).to_f64()))
+}
+
+fn popup_input_region_contains(
+    region: Option<&RegionAttributes>,
+    local: Point<f64, Logical>,
+) -> bool {
+    region.is_none_or(|region| region.contains(local.to_i32_floor()))
+}
+
+/// Converts one backend scroll event into the complete Smithay/Wayland axis
+/// frame used by both sessions. This follows Smithay's Anvil example:
+/// continuous values are preferred, wheel `v120` data is retained, and
+/// finger-source zeroes become explicit stop events.
+#[cfg(test)]
+pub fn axis_frame<B, E>(event: &E) -> AxisFrame
+where
+    B: InputBackend,
+    E: PointerAxisEvent<B>,
+{
+    axis_frame_filtered(event, true, true)
+}
+
+/// Builds a client-facing frame while omitting axes consumed by compositor
+/// keybinds. This preserves a diagonal event's unbound axis.
+pub fn axis_frame_filtered<B, E>(
+    event: &E,
+    include_horizontal: bool,
+    include_vertical: bool,
+) -> AxisFrame
+where
+    B: InputBackend,
+    E: PointerAxisEvent<B>,
+{
+    let horizontal = event
+        .amount(Axis::Horizontal)
+        .unwrap_or_else(|| event.amount_v120(Axis::Horizontal).unwrap_or(0.0) * 15.0 / 120.0);
+    let vertical = event
+        .amount(Axis::Vertical)
+        .unwrap_or_else(|| event.amount_v120(Axis::Vertical).unwrap_or(0.0) * 15.0 / 120.0);
+
+    let mut frame = AxisFrame::new(event.time()).source(event.source());
+    if include_horizontal && horizontal != 0.0 {
+        frame = frame
+            .relative_direction(Axis::Horizontal, event.relative_direction(Axis::Horizontal))
+            .value(Axis::Horizontal, horizontal);
+        if let Some(v120) = event.amount_v120(Axis::Horizontal) {
+            frame = frame.v120(Axis::Horizontal, v120 as i32);
+        }
+    }
+    if include_vertical && vertical != 0.0 {
+        frame = frame
+            .relative_direction(Axis::Vertical, event.relative_direction(Axis::Vertical))
+            .value(Axis::Vertical, vertical);
+        if let Some(v120) = event.amount_v120(Axis::Vertical) {
+            frame = frame.v120(Axis::Vertical, v120 as i32);
+        }
+    }
+    if event.source() == smithay::backend::input::AxisSource::Finger {
+        if include_horizontal && event.amount(Axis::Horizontal) == Some(0.0) {
+            frame = frame.stop(Axis::Horizontal);
+        }
+        if include_vertical && event.amount(Axis::Vertical) == Some(0.0) {
+            frame = frame.stop(Axis::Vertical);
+        }
+    }
+    frame
+}
+
+fn desktop_bounds(outputs: &[Rectangle<i32, Logical>]) -> Option<Rectangle<i32, Logical>> {
+    outputs.iter().copied().reduce(Rectangle::merge)
+}
+
+/// Relative devices cannot accumulate motion inside a gap: clamping every
+/// event to the old edge would pin the pointer there forever. Cross to the
+/// nearest display along the exited edge, keeping the perpendicular coordinate
+/// and the motion remaining after that edge. Absolute devices keep using their
+/// existing desktop-coordinate mapping.
+fn constrain_relative_motion(
+    previous: (f64, f64),
+    position: (f64, f64),
+    outputs: &[Rectangle<i32, Logical>],
+) -> (f64, f64) {
+    let point = Point::<f64, Logical>::from(position);
+    if outputs.iter().any(|output| output.to_f64().contains(point)) {
+        return position;
+    }
+    let Some(source) = outputs
+        .iter()
+        .find(|output| output.to_f64().contains(Point::from(previous)))
+    else {
+        return clamp_to_outputs(position, outputs);
+    };
+    let source = source.to_f64();
+    let right = source.loc.x + source.size.w;
+    let bottom = source.loc.y + source.size.h;
+    let dx = position.0 - previous.0;
+    let dy = position.1 - previous.1;
+    type EdgeCrossing = (f64, f64, (f64, f64), Rectangle<i32, Logical>);
+    let mut best: Option<EdgeCrossing> = None;
+    for output in outputs {
+        let rect = output.to_f64();
+        let end_x = rect.loc.x + rect.size.w;
+        let end_y = rect.loc.y + rect.size.h;
+        let horizontal_band = position.1 >= rect.loc.y && position.1 < end_y;
+        let vertical_band = position.0 >= rect.loc.x && position.0 < end_x;
+        let crossing = if dx > 0.0 && position.0 >= right && rect.loc.x >= right && horizontal_band
+        {
+            Some((
+                (right - previous.0) / dx,
+                rect.loc.x - right,
+                (rect.loc.x + position.0 - right, position.1),
+            ))
+        } else if dx < 0.0 && position.0 < source.loc.x && end_x <= source.loc.x && horizontal_band
+        {
+            Some((
+                (source.loc.x - previous.0) / dx,
+                source.loc.x - end_x,
+                (end_x + position.0 - source.loc.x, position.1),
+            ))
+        } else if dy > 0.0 && position.1 >= bottom && rect.loc.y >= bottom && vertical_band {
+            Some((
+                (bottom - previous.1) / dy,
+                rect.loc.y - bottom,
+                (position.0, rect.loc.y + position.1 - bottom),
+            ))
+        } else if dy < 0.0 && position.1 < source.loc.y && end_y <= source.loc.y && vertical_band {
+            Some((
+                (source.loc.y - previous.1) / dy,
+                source.loc.y - end_y,
+                (position.0, end_y + position.1 - source.loc.y),
+            ))
+        } else {
+            None
+        };
+        if let Some((time, gap, landing)) = crossing
+            && best.as_ref().is_none_or(|(best_time, best_gap, _, _)| {
+                time < *best_time || (time == *best_time && gap < *best_gap)
+            })
+        {
+            best = Some((time, gap, landing, *output));
+        }
+    }
+    best.map_or_else(
+        || clamp_to_outputs(position, outputs),
+        |(_, _, landing, output)| clamp_to_outputs(landing, &[output]),
+    )
+}
+
+fn clamp_to_outputs(position: (f64, f64), outputs: &[Rectangle<i32, Logical>]) -> (f64, f64) {
+    let point = Point::<f64, Logical>::from(position);
+    if outputs.iter().any(|output| output.to_f64().contains(point)) {
+        return position;
+    }
+
+    outputs
+        .iter()
+        .map(|output| {
+            // `Rectangle::contains` is upper-bound-exclusive. Keeping the
+            // constrained point one logical pixel inside that edge ensures
+            // the same geometry will select an output for cursor rendering.
+            let min = output.loc.to_f64();
+            let max = Point::<f64, Logical>::from((
+                (output.loc.x + output.size.w - 1) as f64,
+                (output.loc.y + output.size.h - 1) as f64,
+            ));
+            let constrained = Point::<f64, Logical>::from((
+                point.x.clamp(min.x, max.x),
+                point.y.clamp(min.y, max.y),
+            ));
+            let dx = point.x - constrained.x;
+            let dy = point.y - constrained.y;
+            (dx * dx + dy * dy, constrained)
+        })
+        .min_by(|(left, _), (right, _)| left.total_cmp(right))
+        .map_or(position, |(_, constrained)| constrained.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use smithay::backend::input::{
+        Axis, AxisRelativeDirection, AxisSource, Device, DeviceCapability, Event, InputBackend,
+        PointerAxisEvent, UnusedEvent,
+    };
+    use smithay::utils::Rectangle;
+
+    use super::{
+        WheelAccumulator, WindowHitKind, axis_frame, axis_frame_filtered, clamp_to_outputs,
+        decoration_hit_at, desktop_bounds, process_wheel_bindings, visual_bounds_required,
+        wheel_delta_v120, wheel_direction,
+    };
+    use crate::input::keybinds::WheelDirection;
+
+    #[test]
+    fn x11_popups_cannot_capture_input_outside_their_visual_bounds() {
+        assert!(visual_bounds_required(WindowHitKind::Popup, true));
+        assert!(visual_bounds_required(WindowHitKind::Any, true));
+        assert!(visual_bounds_required(WindowHitKind::Any, false));
+        assert!(!visual_bounds_required(WindowHitKind::Popup, false));
+    }
+
+    #[test]
+    fn shaped_x11_popup_passes_through_tall_transparent_margins() {
+        use smithay::wayland::compositor::{RectangleKind, RegionAttributes};
+        // Representative live ChatGPT voice input shape inside its 772x2849
+        // bounding rectangle. Shape coordinates are local, not output-global.
+        let region = RegionAttributes {
+            rects: vec![
+                (
+                    RectangleKind::Add,
+                    Rectangle::new((225, 1296).into(), (293, 56).into()),
+                ),
+                (
+                    RectangleKind::Add,
+                    Rectangle::new((315, 1354).into(), (113, 121).into()),
+                ),
+            ],
+        };
+        for point in [
+            (370.0, 100.0),
+            (370.0, 2300.0),
+            (100.0, 1400.0),
+            (370.0, 1353.0),
+        ] {
+            assert!(!super::popup_input_region_contains(
+                Some(&region),
+                point.into()
+            ));
+        }
+        for point in [(230.0, 1300.0), (370.0, 1400.0)] {
+            assert!(super::popup_input_region_contains(
+                Some(&region),
+                point.into()
+            ));
+        }
+    }
+
+    #[test]
+    fn popup_input_region_preserves_empty_default_and_subtracted_holes() {
+        use smithay::wayland::compositor::{RectangleKind, RegionAttributes};
+        let point = (20.0, 20.0).into();
+        assert!(super::popup_input_region_contains(None, point));
+        assert!(!super::popup_input_region_contains(
+            Some(&RegionAttributes::default()),
+            point
+        ));
+        let region = RegionAttributes {
+            rects: vec![
+                (
+                    RectangleKind::Add,
+                    Rectangle::new((0, 0).into(), (100, 100).into()),
+                ),
+                (
+                    RectangleKind::Subtract,
+                    Rectangle::new((10, 10).into(), (20, 20).into()),
+                ),
+            ],
+        };
+        assert!(!super::popup_input_region_contains(Some(&region), point));
+        assert!(super::popup_input_region_contains(
+            Some(&region),
+            (40.0, 40.0).into()
+        ));
+        assert!(!super::popup_input_region_contains(
+            Some(&region),
+            (-0.1, 40.0).into()
+        ));
+    }
+
+    #[test]
+    fn resize_band_preserves_content_next_to_thin_and_missing_borders() {
+        use crate::input::grab::ResizeHandle;
+        use crate::window_chrome::Hit;
+        use smithay::utils::{Point, Rectangle};
+
+        for width in [0, 1, 2, 4, 12] {
+            let frame = Rectangle::new((100, 100).into(), (300, 300).into());
+            let band = super::border_resize_band(width);
+            let expected_band = if width == 0 { 3.0 } else { f64::from(width) };
+            assert_eq!(band, expected_band);
+            assert_eq!(
+                decoration_hit_at(frame, Point::from((399.5, 250.0)), true, band),
+                Some(Hit::Resize(ResizeHandle::Right)),
+            );
+            assert_eq!(
+                decoration_hit_at(
+                    frame,
+                    Point::from((400.0 - expected_band - 0.5, 250.0)),
+                    true,
+                    band
+                ),
+                None,
+                "client input beyond the border must remain available (width={width})",
+            );
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    struct TestDevice;
+
+    impl Device for TestDevice {
+        fn id(&self) -> String {
+            "test-pointer".into()
+        }
+
+        fn name(&self) -> String {
+            "test pointer".into()
+        }
+
+        fn has_capability(&self, capability: DeviceCapability) -> bool {
+            capability == DeviceCapability::Pointer
+        }
+
+        fn usb_id(&self) -> Option<(u32, u32)> {
+            None
+        }
+
+        fn syspath(&self) -> Option<PathBuf> {
+            None
+        }
+    }
+
+    struct TestBackend;
+
+    impl InputBackend for TestBackend {
+        type Device = TestDevice;
+        type KeyboardKeyEvent = UnusedEvent;
+        type PointerAxisEvent = TestAxisEvent;
+        type PointerButtonEvent = UnusedEvent;
+        type PointerMotionEvent = TestMotionEvent;
+        type PointerMotionAbsoluteEvent = UnusedEvent;
+        type GestureSwipeBeginEvent = UnusedEvent;
+        type GestureSwipeUpdateEvent = UnusedEvent;
+        type GestureSwipeEndEvent = UnusedEvent;
+        type GesturePinchBeginEvent = UnusedEvent;
+        type GesturePinchUpdateEvent = UnusedEvent;
+        type GesturePinchEndEvent = UnusedEvent;
+        type GestureHoldBeginEvent = UnusedEvent;
+        type GestureHoldEndEvent = UnusedEvent;
+        type TouchDownEvent = UnusedEvent;
+        type TouchUpEvent = UnusedEvent;
+        type TouchMotionEvent = UnusedEvent;
+        type TouchCancelEvent = UnusedEvent;
+        type TouchFrameEvent = UnusedEvent;
+        type TabletToolAxisEvent = UnusedEvent;
+        type TabletToolProximityEvent = UnusedEvent;
+        type TabletToolTipEvent = UnusedEvent;
+        type TabletToolButtonEvent = UnusedEvent;
+        type SwitchToggleEvent = UnusedEvent;
+        type SpecialEvent = ();
+    }
+
+    struct TestMotionEvent(f64, f64);
+    impl Event<TestBackend> for TestMotionEvent {
+        fn time(&self) -> smithay::backend::input::InputTime {
+            smithay::backend::input::InputTime::from_micros(42_000)
+        }
+        fn device(&self) -> TestDevice {
+            TestDevice
+        }
+    }
+    impl smithay::backend::input::PointerMotionEvent<TestBackend> for TestMotionEvent {
+        fn delta_x(&self) -> f64 {
+            self.0
+        }
+        fn delta_y(&self) -> f64 {
+            self.1
+        }
+        fn delta_x_unaccel(&self) -> f64 {
+            self.0
+        }
+        fn delta_y_unaccel(&self) -> f64 {
+            self.1
+        }
+    }
+
+    struct TestAxisEvent {
+        source: AxisSource,
+        horizontal: Option<f64>,
+        vertical: Option<f64>,
+        horizontal_v120: Option<f64>,
+        vertical_v120: Option<f64>,
+        horizontal_direction: AxisRelativeDirection,
+        vertical_direction: AxisRelativeDirection,
+    }
+
+    impl Event<TestBackend> for TestAxisEvent {
+        fn time(&self) -> smithay::backend::input::InputTime {
+            smithay::backend::input::InputTime::from_micros(42_000)
+        }
+
+        fn device(&self) -> TestDevice {
+            TestDevice
+        }
+    }
+
+    impl PointerAxisEvent<TestBackend> for TestAxisEvent {
+        fn amount(&self, axis: Axis) -> Option<f64> {
+            match axis {
+                Axis::Horizontal => self.horizontal,
+                Axis::Vertical => self.vertical,
+            }
+        }
+
+        fn amount_v120(&self, axis: Axis) -> Option<f64> {
+            match axis {
+                Axis::Horizontal => self.horizontal_v120,
+                Axis::Vertical => self.vertical_v120,
+            }
+        }
+
+        fn source(&self) -> AxisSource {
+            self.source
+        }
+
+        fn relative_direction(&self, axis: Axis) -> AxisRelativeDirection {
+            match axis {
+                Axis::Horizontal => self.horizontal_direction,
+                Axis::Vertical => self.vertical_direction,
+            }
+        }
+    }
+
+    fn scaled_output(name: &str, size: (i32, i32), scale: f64) -> smithay::output::Output {
+        use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
+        let output = Output::new(
+            name.into(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "test".into(),
+                model: "test".into(),
+                serial_number: "test".into(),
+            },
+        );
+        output.change_current_state(
+            Some(Mode {
+                size: size.into(),
+                refresh: 60_000,
+            }),
+            None,
+            Some(Scale::Fractional(scale)),
+            None,
+        );
+        output
+    }
+
+    #[test]
+    fn relative_pointer_crosses_scaled_monitor_gaps_in_both_directions() {
+        use smithay::backend::input::InputEvent;
+        for scale in [1.0, 1.2, 1.25, 1.5, 2.0, 3.0] {
+            let primary = scaled_output("DP-1", (2560, 1440), scale);
+            let secondary = scaled_output("DP-2", (1920, 1200), 1.0);
+            let mut space = smithay::desktop::Space::<smithay::desktop::Window>::default();
+            space.map_output(&primary, (0, 0));
+            space.map_output(&secondary, (2560, 0));
+            let width = space.output_geometry(&primary).unwrap().size.w as f64;
+            let mut pointer = super::Pointer::new((width - 0.5, 300.0));
+            // Two physical pixels become 2/scale logical pixels, including any
+            // remainder after the source edge; the invisible gap consumes none.
+            pointer.process_input_event::<TestBackend>(
+                &InputEvent::PointerMotion {
+                    event: TestMotionEvent(2.0, 0.0),
+                },
+                &space,
+            );
+            let expected = 2560.0 + 2.0 / scale - 0.5;
+            assert!(
+                (pointer.position().0 - expected).abs() < 1e-6,
+                "scale={scale}: {:?}",
+                pointer.position()
+            );
+            assert_eq!(pointer.position().1, 300.0);
+            assert_eq!(
+                space.output_under(pointer.position()).next(),
+                Some(&secondary)
+            );
+            pointer.set_position((2560.5, 300.0));
+            pointer.process_input_event::<TestBackend>(
+                &InputEvent::PointerMotion {
+                    event: TestMotionEvent(-2.0, 0.0),
+                },
+                &space,
+            );
+            assert_eq!(pointer.position(), (width - 1.5, 300.0));
+            assert_eq!(
+                space.output_under(pointer.position()).next(),
+                Some(&primary)
+            );
+        }
+    }
+
+    #[test]
+    fn gap_crossing_chooses_nearest_monitor_regardless_of_output_order() {
+        let outputs = [
+            Rectangle::new((500, -50).into(), (100, 100).into()),
+            Rectangle::new((-100, -50).into(), (100, 100).into()),
+            Rectangle::new((100, -50).into(), (100, 100).into()),
+        ];
+        assert_eq!(
+            super::constrain_relative_motion((-0.5, -10.0), (0.5, -10.0), &outputs),
+            (100.5, -10.0)
+        );
+        assert_eq!(
+            super::constrain_relative_motion((100.5, -10.0), (99.5, -10.0), &outputs),
+            (-0.5, -10.0)
+        );
+        // Reload can put the old pointer position in a gap. Re-anchor to a
+        // real monitor instead of inferring an edge from that stale position.
+        assert_eq!(
+            super::constrain_relative_motion((50.0, -10.0), (51.0, -10.0), &outputs),
+            (100.0, -10.0)
+        );
+    }
+
+    #[test]
+    fn gap_crossing_respects_vertical_layout_and_unshared_edges() {
+        let outputs = [
+            Rectangle::new((0, 0).into(), (100, 100).into()),
+            Rectangle::new((0, 200).into(), (80, 60).into()),
+        ];
+        assert_eq!(
+            super::constrain_relative_motion((40.0, 99.5), (40.0, 100.5), &outputs),
+            (40.0, 200.5)
+        );
+        assert_eq!(
+            super::constrain_relative_motion((40.0, 200.5), (40.0, 199.5), &outputs),
+            (40.0, 99.5)
+        );
+        assert_eq!(
+            super::constrain_relative_motion((90.0, 99.5), (90.0, 100.5), &outputs),
+            (90.0, 99.0)
+        );
+        assert_eq!(
+            super::constrain_relative_motion((40.0, 0.5), (40.0, -0.5), &outputs),
+            (40.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn clamp_respects_configured_outputs_and_their_edges() {
+        let outputs = configured_outputs();
+        for (position, expected) in [
+            ((100.0, 200.0), (100.0, 200.0)),
+            ((3000.0, 800.0), (3000.0, 800.0)),
+            ((2559.0, 600.0), (2559.0, 600.0)),
+            ((2560.0, 600.0), (2560.0, 600.0)),
+            ((3000.0, 1300.0), (3000.0, 1199.0)),
+            ((5000.0, -50.0), (4479.0, 0.0)),
+        ] {
+            assert_eq!(
+                clamp_to_outputs(position, &outputs),
+                expected,
+                "{position:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_bounds_cover_both_configured_outputs() {
+        assert_eq!(
+            desktop_bounds(&configured_outputs()),
+            Some(Rectangle::new((0, 0).into(), (4480, 1440).into()))
+        );
+    }
+
+    #[test]
+    fn wheel_axis_frame_keeps_v120_and_derives_continuous_values() {
+        let event = TestAxisEvent {
+            source: AxisSource::Wheel,
+            horizontal: None,
+            vertical: None,
+            horizontal_v120: Some(-240.0),
+            vertical_v120: Some(120.0),
+            horizontal_direction: AxisRelativeDirection::Inverted,
+            vertical_direction: AxisRelativeDirection::Identical,
+        };
+
+        let frame = axis_frame(&event);
+        assert_eq!(frame.time.millis(), 42);
+        assert_eq!(frame.source, Some(AxisSource::Wheel));
+        assert_eq!(frame.axis, (-30.0, 15.0));
+        assert_eq!(frame.v120, Some((-240, 120)));
+        assert_eq!(
+            frame.relative_direction,
+            (
+                AxisRelativeDirection::Inverted,
+                AxisRelativeDirection::Identical
+            )
+        );
+        assert_eq!(frame.stop, (false, false));
+    }
+
+    #[test]
+    fn filtered_axis_frame_preserves_only_the_unbound_axis() {
+        let event = TestAxisEvent {
+            source: AxisSource::Wheel,
+            horizontal: None,
+            vertical: None,
+            horizontal_v120: Some(-120.0),
+            vertical_v120: Some(120.0),
+            horizontal_direction: AxisRelativeDirection::Identical,
+            vertical_direction: AxisRelativeDirection::Identical,
+        };
+
+        let frame = axis_frame_filtered(&event, true, false);
+        assert_eq!(frame.axis, (-15.0, 0.0));
+        assert_eq!(frame.v120, Some((-120, 0)));
+    }
+
+    #[test]
+    fn wheel_accumulator_handles_partial_multiple_and_reversed_notches() {
+        let mut accumulator = WheelAccumulator::default();
+        assert_eq!(accumulator.accumulate(Axis::Vertical, 30.0), 0);
+        assert_eq!(accumulator.accumulate(Axis::Vertical, 90.0), 1);
+        assert_eq!(accumulator.accumulate(Axis::Vertical, 300.0), 2);
+        assert_eq!(accumulator.accumulate(Axis::Vertical, -30.0), 0);
+        assert_eq!(accumulator.accumulate(Axis::Vertical, -90.0), -1);
+    }
+
+    #[test]
+    fn wheel_accumulator_keeps_axes_independent_and_resets() {
+        let mut accumulator = WheelAccumulator::default();
+        assert_eq!(accumulator.accumulate(Axis::Horizontal, 60.0), 0);
+        assert_eq!(accumulator.accumulate(Axis::Vertical, 120.0), 1);
+        assert_eq!(accumulator.accumulate(Axis::Horizontal, 60.0), 1);
+        accumulator.accumulate(Axis::Vertical, 60.0);
+        accumulator.reset(Axis::Vertical);
+        assert_eq!(accumulator.accumulate(Axis::Vertical, 60.0), 0);
+        accumulator.reset_all();
+        assert_eq!(accumulator.accumulate(Axis::Horizontal, 60.0), 0);
+    }
+
+    #[test]
+    fn wheel_helpers_derive_v120_and_map_logical_directions() {
+        let event = TestAxisEvent {
+            source: AxisSource::Wheel,
+            horizontal: Some(-15.0),
+            vertical: Some(30.0),
+            horizontal_v120: None,
+            vertical_v120: None,
+            horizontal_direction: AxisRelativeDirection::Identical,
+            vertical_direction: AxisRelativeDirection::Identical,
+        };
+        assert_eq!(wheel_delta_v120(&event, Axis::Horizontal), -120.0);
+        assert_eq!(wheel_delta_v120(&event, Axis::Vertical), 240.0);
+        assert_eq!(
+            wheel_direction(Axis::Horizontal, -1.0),
+            Some(WheelDirection::Left)
+        );
+        assert_eq!(
+            wheel_direction(Axis::Horizontal, 1.0),
+            Some(WheelDirection::Right)
+        );
+        assert_eq!(
+            wheel_direction(Axis::Vertical, -1.0),
+            Some(WheelDirection::Up)
+        );
+        assert_eq!(
+            wheel_direction(Axis::Vertical, 1.0),
+            Some(WheelDirection::Down)
+        );
+        assert_eq!(wheel_direction(Axis::Vertical, 0.0), None);
+    }
+
+    #[test]
+    fn wheel_binding_policy_consumes_only_matches_and_emits_full_notches() {
+        let wheel = |source, vertical_v120| TestAxisEvent {
+            source,
+            horizontal: None,
+            vertical: None,
+            horizontal_v120: None,
+            vertical_v120: Some(vertical_v120),
+            horizontal_direction: AxisRelativeDirection::Identical,
+            vertical_direction: AxisRelativeDirection::Identical,
+        };
+        let mut accumulator = WheelAccumulator::default();
+
+        let first = process_wheel_bindings(
+            &wheel(AxisSource::Wheel, 60.0),
+            &mut accumulator,
+            true,
+            |direction| (direction == WheelDirection::Down).then_some("zoom-out"),
+        );
+        assert!(first.forward_horizontal);
+        assert!(!first.forward_vertical);
+        assert!(first.actions.is_empty());
+
+        let second = process_wheel_bindings(
+            &wheel(AxisSource::Wheel, 60.0),
+            &mut accumulator,
+            true,
+            |direction| (direction == WheelDirection::Down).then_some("zoom-out"),
+        );
+        assert_eq!(second.actions, vec![(WheelDirection::Down, "zoom-out")]);
+
+        let unbound = process_wheel_bindings(
+            &wheel(AxisSource::Wheel, -120.0),
+            &mut accumulator,
+            true,
+            |_| None::<&str>,
+        );
+        assert!(unbound.forward_vertical);
+
+        process_wheel_bindings(
+            &wheel(AxisSource::Wheel, 60.0),
+            &mut accumulator,
+            true,
+            |_| Some("zoom-out"),
+        );
+        let bypassed = process_wheel_bindings(
+            &wheel(AxisSource::Wheel, 120.0),
+            &mut accumulator,
+            false,
+            |_| Some("zoom-out"),
+        );
+        assert!(bypassed.forward_vertical);
+        assert!(bypassed.actions.is_empty());
+        let after_reset = process_wheel_bindings(
+            &wheel(AxisSource::Wheel, 60.0),
+            &mut accumulator,
+            true,
+            |_| Some("zoom-out"),
+        );
+        assert!(after_reset.actions.is_empty());
+    }
+
+    #[test]
+    fn finger_axis_frame_marks_zero_axes_stopped() {
+        let event = TestAxisEvent {
+            source: AxisSource::Finger,
+            horizontal: Some(0.0),
+            vertical: Some(0.0),
+            horizontal_v120: None,
+            vertical_v120: None,
+            horizontal_direction: AxisRelativeDirection::Identical,
+            vertical_direction: AxisRelativeDirection::Identical,
+        };
+
+        let frame = axis_frame(&event);
+        assert_eq!(frame.source, Some(AxisSource::Finger));
+        assert_eq!(frame.axis, (0.0, 0.0));
+        assert_eq!(frame.v120, None);
+        assert_eq!(frame.stop, (true, true));
+    }
+
+    fn configured_outputs() -> [Rectangle<i32, smithay::utils::Logical>; 2] {
+        [
+            Rectangle::new((0, 0).into(), (2560, 1440).into()),
+            Rectangle::new((2560, 0).into(), (1920, 1200).into()),
+        ]
+    }
+
+    #[test]
+    fn client_cursor_placement_respects_scaled_outputs_gaps_and_removed_outputs() {
+        let mut space = smithay::desktop::Space::<smithay::desktop::Window>::default();
+        let left = scaled_output("left", (1000, 750), 1.25);
+        let right = scaled_output("right", (500, 500), 1.0);
+        space.map_output(&left, (-1000, -100));
+        space.map_output(&right, (100, 50));
+        let mut pointer = super::Pointer::new((-500.0, 100.0));
+        for (requested, expected) in [
+            ((-500.25, 100.5), (-500.25, 100.5)),
+            ((-1500.0, -500.0), (-1000.0, -100.0)),
+            ((-150.0, 100.0), (-201.0, 100.0)),
+            ((900.0, 900.0), (599.0, 549.0)),
+        ] {
+            let placed = pointer
+                .set_position_on_outputs(requested.into(), &space)
+                .unwrap();
+            assert_eq!(pointer.position(), expected);
+            assert!(space.output_under(placed).next().is_some());
+        }
+        let before = pointer.position();
+        for invalid in [(f64::NAN, 0.0), (0.0, f64::INFINITY)] {
+            assert!(
+                pointer
+                    .set_position_on_outputs(invalid.into(), &space)
+                    .is_none()
+            );
+            assert_eq!(pointer.position(), before);
+        }
+        space.unmap_output(&right);
+        pointer.set_position_on_outputs((900.0, 900.0).into(), &space);
+        assert_eq!(pointer.position(), (-201.0, 499.0));
+        space.unmap_output(&left);
+        assert!(
+            pointer
+                .set_position_on_outputs((0.0, 0.0).into(), &space)
+                .is_none()
+        );
+        assert_eq!(pointer.position(), (-201.0, 499.0));
+    }
+}

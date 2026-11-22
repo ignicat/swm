@@ -1,0 +1,14 @@
+[package]
+name = "swm-config"
+version = "0.1.0"
+edition = "2024"
+description = "Configuration loading and parsing for swm (simple window manager)"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+regex = "1"
+rune-cfg.workspace = true

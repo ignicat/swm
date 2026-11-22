@@ -1,0 +1,12 @@
+[package]
+name = "swm-core"
+version = "0.1.0"
+edition = "2024"
+description = "Core layout and window management logic for swm (simple window manager)"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]

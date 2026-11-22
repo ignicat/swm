@@ -1,0 +1,6 @@
+[Unit]
+Description=Shutdown running swm session
+DefaultDependencies=no
+StopWhenUnneeded=true
+Conflicts=swm-direct-session.target graphical-session.target graphical-session-pre.target
+After=swm-direct-session.target graphical-session.target graphical-session-pre.target

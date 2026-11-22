@@ -1,0 +1,11 @@
+[Unit]
+Description=swm desktop portal backend
+PartOf=graphical-session.target xdg-desktop-portal.service
+Requisite=graphical-session.target
+After=graphical-session.target pipewire.service
+
+[Service]
+Type=dbus
+BusName=org.freedesktop.impl.portal.desktop.swm
+ExecStart=/usr/bin/xdg-desktop-portal-swm
+Restart=on-failure

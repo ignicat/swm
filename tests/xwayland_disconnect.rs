@@ -1,0 +1,2615 @@
+//! Real nested-session regression: kill only the disposable session's XWayland.
+//! Requires a running Wayland desktop and XWayland; run explicitly with --ignored.
+#![cfg(all(feature = "xwayland", feature = "winit"))]
+
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use swm_ipc::{NodeRequest, NodeSelector, Request, Response};
+use wayland_client::protocol::{
+    wl_buffer, wl_compositor, wl_keyboard, wl_registry, wl_seat, wl_shm, wl_shm_pool,
+    wl_subcompositor, wl_subsurface, wl_surface,
+};
+use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, delegate_noop};
+use wayland_protocols::wp::single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1 as pixel;
+use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
+use wayland_protocols::xdg::decoration::zv1::client::{
+    zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
+};
+use wayland_protocols::xdg::dialog::v1::client::{xdg_dialog_v1, xdg_wm_dialog_v1};
+use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+use wayland_protocols_wlr::foreign_toplevel::v1::client::{
+    zwlr_foreign_toplevel_handle_v1 as foreign_handle,
+    zwlr_foreign_toplevel_manager_v1 as foreign_manager,
+};
+use wayland_protocols_wlr::layer_shell::v1::client::{
+    zwlr_layer_shell_v1 as layer_shell, zwlr_layer_surface_v1 as layer_surface,
+};
+use x11rb::connection::Connection as _;
+use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, CreateWindowAux, WindowClass};
+use x11rb::rust_connection::RustConnection;
+use x11rb::wrapper::ConnectionExt as _;
+
+#[path = "support/accessible_capture.rs"]
+mod accessible_capture;
+#[path = "support/alt_tab_visibility.rs"]
+mod alt_tab_visibility;
+#[path = "support/collapsed_node_close.rs"]
+mod collapsed_node_close;
+#[path = "support/fifo_nested.rs"]
+mod fifo_nested;
+#[path = "support/fullscreen_multi_output.rs"]
+mod fullscreen_multi_output;
+#[path = "support/fullscreen_navigation.rs"]
+mod fullscreen_navigation;
+#[path = "support/image_copy_client.rs"]
+mod image_copy_client;
+#[path = "support/image_copy_nested.rs"]
+mod image_copy_nested;
+#[path = "support/keyboard_leds.rs"]
+mod keyboard_leds;
+#[path = "support/landmark_presentation.rs"]
+mod landmark_presentation;
+#[path = "support/multi_keyboard.rs"]
+mod multi_keyboard;
+#[path = "support/offscreen_pointer.rs"]
+mod offscreen_pointer;
+#[path = "support/output_management.rs"]
+mod output_management;
+#[path = "support/output_origin.rs"]
+mod output_origin;
+#[path = "support/pointer_warp.rs"]
+mod pointer_warp;
+#[path = "support/resize_drag.rs"]
+mod resize_drag;
+#[path = "support/steam_close.rs"]
+mod steam_close;
+#[path = "support/surface_dismissal.rs"]
+mod surface_dismissal;
+#[path = "support/commit_timing_nested.rs"]
+mod timing_nested;
+#[path = "support/window_movement.rs"]
+mod window_movement;
+#[path = "support/x11_fullscreen_negotiation.rs"]
+mod x11_fullscreen_negotiation;
+
+struct Fixture {
+    path: PathBuf,
+    process: Child,
+    ipc: Option<swm_ipc::Connection>,
+    display: String,
+    xwayland: u32,
+}
+
+fn wait_for<T>(description: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(result) = probe() {
+            return result;
+        }
+        assert!(Instant::now() < deadline, "timed out: {description}");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+impl Fixture {
+    fn new() -> Self {
+        Self::with_config("")
+    }
+
+    fn with_config(extra: &str) -> Self {
+        Self::with_capture_config(extra, false)
+    }
+
+    fn with_capture_config(extra: &str, capture: bool) -> Self {
+        Self::with_backend(extra, capture, false)
+    }
+
+    fn with_two_outputs(extra: &str) -> Self {
+        Self::with_backend(extra, true, true)
+    }
+
+    fn with_backend(extra: &str, capture: bool, two_outputs: bool) -> Self {
+        Self::with_layout_backend(extra, capture, two_outputs, None)
+    }
+
+    fn with_output_layout(positions: &str) -> Self {
+        Self::with_layout_backend(
+            "animations:\n enabled false\nend\n",
+            true,
+            true,
+            Some(positions),
+        )
+    }
+
+    fn with_layout_backend(
+        extra: &str,
+        capture: bool,
+        two_outputs: bool,
+        output_layout: Option<&str>,
+    ) -> Self {
+        let host_runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+        let host_display = PathBuf::from(std::env::var_os("WAYLAND_DISPLAY").unwrap());
+        let host_display = if host_display.is_absolute() {
+            host_display
+        } else {
+            host_runtime.join(host_display)
+        };
+        let path = std::env::temp_dir().join(format!(
+            "swm-xwayland-disconnect-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = path.join("swm.rune");
+        let bindings = if two_outputs {
+            "  \"alt+tab\" \"cycle-focus\"\n  \"alt+q\" \"close-focused\"\n  \"F7\" \"close-focused\"\n  \"F8\" \"resize-window-right\"\n  \"F9\" \"resize-window-down\"\n  \"F10\" \"toggle-fullscreen\"\n"
+        } else {
+            ""
+        };
+        let bindings = if output_layout.is_some() {
+            format!(
+                "{bindings}  \"F12\" \"zoom-fit\"\n  \"F5\" \"toggle-focused-pin\"\n  \"F4\" \"maximize-focused\"\n"
+            )
+        } else {
+            bindings.to_string()
+        };
+        fs::write(&config, format!("keybinds:\n{bindings}end\n{extra}\n")).unwrap();
+        let log = File::create(path.join("console.log")).unwrap();
+        let binary = if two_outputs {
+            std::env::var_os("SWM_TEST_WINIT_SERVER").expect(
+                "build nested_fullscreen_server and set SWM_TEST_WINIT_SERVER; see docs/testing.md",
+            )
+        } else {
+            std::env::var_os("SWM_TEST_BINARY").unwrap_or_else(|| env!("CARGO_BIN_EXE_swm").into())
+        };
+        let mut command = Command::new(binary);
+        if let Some(positions) = output_layout {
+            command.env("SWM_TEST_OUTPUT_LAYOUT", positions);
+        }
+        command.args(["--winit", "--config"]).arg(&config);
+        if two_outputs {
+            command
+                .env("SWM_TEST_WINIT_CONFIG", &config)
+                .env("SWM_TEST_WINIT_CONTROL", path.join("input.sock"))
+                .env(
+                    "SWM_ALLOW_VIRTUAL_KEYBOARD",
+                    std::env::current_exe().unwrap(),
+                );
+        }
+        let process = command
+            .env("WAYLAND_DISPLAY", host_display)
+            .env("XDG_RUNTIME_DIR", &path)
+            .env("XDG_STATE_HOME", path.join("state"))
+            .env("XDG_CONFIG_HOME", path.join("config"))
+            .env(
+                "SWM_ALLOW_SCREEN_CAPTURE",
+                if capture {
+                    std::env::current_exe().unwrap()
+                } else {
+                    PathBuf::new()
+                },
+            )
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_SOCKET")
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap();
+        // Construct the guard before readiness waits so a failed assertion
+        // cannot leave a nested compositor or its XWayland running.
+        let socket = path.join("swm/swm.sock");
+        let mut fixture = Fixture {
+            path,
+            process,
+            ipc: None,
+            display: String::new(),
+            xwayland: 0,
+        };
+        fixture.ipc = Some(wait_for("nested IPC", || {
+            swm_ipc::Connection::connect_to(&socket).ok()
+        }));
+        fixture
+            .ipc
+            .as_ref()
+            .unwrap()
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        fixture.display = wait_for("nested XWayland readiness", || {
+            let log = fs::read_to_string(fixture.path.join("console.log")).ok()?;
+            log.lines().find_map(|line| {
+                line.split_once("xwayland: ready, DISPLAY=")
+                    .map(|(_, value)| value.trim().to_owned())
+            })
+        });
+        fixture.xwayland = wait_for("owned XWayland child", || {
+            let children =
+                fs::read_to_string(format!("/proc/{0}/task/{0}/children", fixture.process.id()))
+                    .ok()?;
+            children.split_whitespace().find_map(|pid| {
+                let command = fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+                (command.trim() == "Xwayland").then(|| pid.parse().unwrap())
+            })
+        });
+        fixture
+    }
+
+    fn request(&mut self, request: Request) -> Response {
+        self.ipc
+            .as_mut()
+            .unwrap()
+            .request(&request, &[])
+            .unwrap()
+            .response
+    }
+
+    fn nodes(&mut self) -> Vec<swm_ipc::NodeInfo> {
+        match self.request(Request::Node(NodeRequest::List { output: None })) {
+            Response::NodeList(list) => list
+                .outputs
+                .into_iter()
+                .flat_map(|output| output.nodes)
+                .collect(),
+            response => panic!("unexpected nodes response: {response:?}"),
+        }
+    }
+
+    fn node(&mut self, title: &str) -> swm_ipc::NodeInfo {
+        wait_for(title, || {
+            self.nodes().into_iter().find(|node| node.title == title)
+        })
+    }
+
+    fn ack(&mut self, request: Request) {
+        assert!(matches!(self.request(request), Response::Ack));
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        // The parent owns this child; never touch the desktop's XWayland.
+        if self.xwayland != 0 {
+            let parent = fs::read_to_string(format!("/proc/{}/status", self.xwayland))
+                .ok()
+                .and_then(|status| {
+                    status.lines().find_map(|line| {
+                        line.strip_prefix("PPid:")
+                            .and_then(|pid| pid.trim().parse::<u32>().ok())
+                    })
+                });
+            if parent == Some(self.process.id()) {
+                unsafe {
+                    libc::kill(self.xwayland as i32, libc::SIGKILL);
+                }
+            }
+        }
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+        if std::thread::panicking() {
+            eprintln!("nested diagnostic files: {}", self.path.display());
+        } else {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+fn x11_window(connection: &RustConnection, title: &str) -> u32 {
+    let screen = &connection.setup().roots[0];
+    let window = connection.generate_id().unwrap();
+    connection
+        .create_window(
+            screen.root_depth,
+            window,
+            screen.root,
+            30,
+            30,
+            240,
+            160,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            0,
+            &CreateWindowAux::new().background_pixel(screen.white_pixel),
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+    connection
+        .change_property8(
+            x11rb::protocol::xproto::PropMode::REPLACE,
+            window,
+            AtomEnum::WM_NAME,
+            AtomEnum::STRING,
+            title.as_bytes(),
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+    connection.map_window(window).unwrap().check().unwrap();
+    connection.flush().unwrap();
+    window
+}
+
+use wayland_protocols::xdg::foreign::zv2::client::{
+    zxdg_exported_v2, zxdg_exporter_v2, zxdg_imported_v2, zxdg_importer_v2,
+};
+
+#[derive(Default)]
+struct NativeState {
+    outside_presses: usize,
+    hold_layer_buffer: bool,
+    pointer_buttons: Vec<(
+        u32,
+        wayland_client::WEnum<wayland_client::protocol::wl_pointer::ButtonState>,
+    )>,
+    commit_timing: timing_nested::Observations,
+    fifo_frames: Vec<(u32, u32)>,
+    globals: HashMap<String, u32>,
+    output_management: output_management::Observations,
+    pointer_warp: pointer_warp::Observations,
+    surface: Option<wl_surface::WlSurface>,
+    buffer: Option<wl_buffer::WlBuffer>,
+    integer_scales: Vec<i32>,
+    fractional_scales: Vec<u32>,
+    registry: Option<wl_registry::WlRegistry>,
+    toplevel: Option<xdg_toplevel::XdgToplevel>,
+    exported_handles: Vec<String>,
+    keyboard_focused: bool,
+    close_requested: bool,
+    keyboard_events: Vec<(u32, wl_keyboard::KeyState)>,
+    keyboard_keymaps: usize,
+    keyboard_modifiers: (u32, u32, u32, u32),
+    keyboard_delivery_events: Vec<&'static str>,
+    viewport: Option<wp_viewport::WpViewport>,
+    resize_for_configures: bool,
+    configured_fullscreen: bool,
+    configured_maximized: bool,
+    configured_all_tiled: bool,
+    configure_count: usize,
+    configured_size: (i32, i32),
+    first_configured_size: Option<(i32, i32)>,
+    foreign_toplevel: Option<foreign_handle::ZwlrForeignToplevelHandleV1>,
+    foreign_titles: HashMap<String, foreign_handle::ZwlrForeignToplevelHandleV1>,
+}
+
+impl Dispatch<foreign_manager::ZwlrForeignToplevelManagerV1, ()> for NativeState {
+    fn event(
+        state: &mut Self,
+        _: &foreign_manager::ZwlrForeignToplevelManagerV1,
+        event: foreign_manager::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let foreign_manager::Event::Toplevel { toplevel } = event {
+            state.foreign_toplevel = Some(toplevel);
+        }
+    }
+
+    wayland_client::event_created_child!(NativeState, foreign_manager::ZwlrForeignToplevelManagerV1, [
+        foreign_manager::EVT_TOPLEVEL_OPCODE => (foreign_handle::ZwlrForeignToplevelHandleV1, ())
+    ]);
+}
+impl Dispatch<foreign_handle::ZwlrForeignToplevelHandleV1, ()> for NativeState {
+    fn event(
+        state: &mut Self,
+        handle: &foreign_handle::ZwlrForeignToplevelHandleV1,
+        event: foreign_handle::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let foreign_handle::Event::Title { title } = event {
+            state.foreign_titles.insert(title, handle.clone());
+        }
+    }
+}
+delegate_noop!(NativeState: ignore wl_seat::WlSeat);
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for NativeState {
+    fn event(
+        state: &mut Self,
+        _: &wl_keyboard::WlKeyboard,
+        event: wl_keyboard::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_keyboard::Event::Enter { surface, .. } => {
+                state.keyboard_focused = state.surface.as_ref() == Some(&surface)
+            }
+            wl_keyboard::Event::Leave { .. } => state.keyboard_focused = false,
+            wl_keyboard::Event::Keymap { .. } => state.keyboard_keymaps += 1,
+            wl_keyboard::Event::Modifiers {
+                mods_depressed,
+                mods_latched,
+                mods_locked,
+                group,
+                ..
+            } => {
+                state.keyboard_delivery_events.push("modifiers");
+                state.keyboard_modifiers = (mods_depressed, mods_latched, mods_locked, group);
+            }
+            wl_keyboard::Event::Key {
+                key,
+                state: wayland_client::WEnum::Value(key_state),
+                ..
+            } => {
+                state.keyboard_delivery_events.push("key");
+                state.keyboard_events.push((key, key_state));
+            }
+            _ => {}
+        }
+    }
+}
+impl Dispatch<wl_registry::WlRegistry, ()> for NativeState {
+    fn event(
+        state: &mut Self,
+        _: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global {
+            name, interface, ..
+        } = event
+        {
+            state.globals.insert(interface, name);
+        }
+    }
+}
+impl Dispatch<xdg_surface::XdgSurface, ()> for NativeState {
+    fn event(
+        state: &mut Self,
+        surface: &xdg_surface::XdgSurface,
+        event: xdg_surface::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let xdg_surface::Event::Configure { serial } = event {
+            state.configure_count += 1;
+            surface.ack_configure(serial);
+            let window = state.surface.as_ref().unwrap();
+            window.attach(state.buffer.as_ref(), 0, 0);
+            if state.resize_for_configures {
+                window.damage_buffer(0, 0, i32::MAX, i32::MAX);
+            }
+            window.commit();
+        }
+    }
+}
+impl Dispatch<xdg_wm_base::XdgWmBase, ()> for NativeState {
+    fn event(
+        _: &mut Self,
+        shell: &xdg_wm_base::XdgWmBase,
+        event: xdg_wm_base::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let xdg_wm_base::Event::Ping { serial } = event {
+            shell.pong(serial);
+        }
+    }
+}
+delegate_noop!(NativeState: ignore layer_shell::ZwlrLayerShellV1);
+impl Dispatch<layer_surface::ZwlrLayerSurfaceV1, ()> for NativeState {
+    fn event(
+        state: &mut Self,
+        layer: &layer_surface::ZwlrLayerSurfaceV1,
+        event: layer_surface::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let layer_surface::Event::Closed = event {
+            state.close_requested = true;
+        }
+        if let layer_surface::Event::Configure { serial, .. } = event {
+            layer.ack_configure(serial);
+            if !state.hold_layer_buffer {
+                let surface = state.surface.as_ref().unwrap();
+                surface.attach(state.buffer.as_ref(), 0, 0);
+                surface.commit();
+            }
+        }
+    }
+}
+delegate_noop!(NativeState: ignore wl_compositor::WlCompositor);
+delegate_noop!(NativeState: ignore wl_subcompositor::WlSubcompositor);
+delegate_noop!(NativeState: ignore wl_subsurface::WlSubsurface);
+delegate_noop!(NativeState: ignore wl_shm::WlShm);
+delegate_noop!(NativeState: ignore wl_shm_pool::WlShmPool);
+impl Dispatch<wl_surface::WlSurface, ()> for NativeState {
+    fn event(
+        state: &mut Self,
+        _: &wl_surface::WlSurface,
+        event: wl_surface::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_surface::Event::PreferredBufferScale { factor } = event {
+            state.integer_scales.push(factor);
+        }
+    }
+}
+use wayland_protocols::wp::fractional_scale::v1::client::{
+    wp_fractional_scale_manager_v1 as fractional_manager, wp_fractional_scale_v1 as fractional,
+};
+delegate_noop!(NativeState: ignore fractional_manager::WpFractionalScaleManagerV1);
+impl Dispatch<fractional::WpFractionalScaleV1, ()> for NativeState {
+    fn event(
+        state: &mut Self,
+        _: &fractional::WpFractionalScaleV1,
+        event: fractional::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let fractional::Event::PreferredScale { scale } = event {
+            state.fractional_scales.push(scale);
+        }
+    }
+}
+delegate_noop!(NativeState: ignore wl_buffer::WlBuffer);
+delegate_noop!(NativeState: ignore pixel::WpSinglePixelBufferManagerV1);
+delegate_noop!(NativeState: ignore wp_viewporter::WpViewporter);
+delegate_noop!(NativeState: ignore wp_viewport::WpViewport);
+impl Dispatch<xdg_toplevel::XdgToplevel, ()> for NativeState {
+    fn event(
+        state: &mut Self,
+        _: &xdg_toplevel::XdgToplevel,
+        event: xdg_toplevel::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let xdg_toplevel::Event::Close = event {
+            state.close_requested = true;
+            return;
+        }
+        if let xdg_toplevel::Event::Configure {
+            width,
+            height,
+            states,
+        } = event
+        {
+            state.configured_size = (width, height);
+            state.first_configured_size.get_or_insert((width, height));
+            state.configured_fullscreen =
+                states.as_chunks::<4>().0.iter().any(|bytes| {
+                    u32::from_ne_bytes(*bytes) == xdg_toplevel::State::Fullscreen as u32
+                });
+            state.configured_maximized =
+                states.as_chunks::<4>().0.iter().any(|bytes| {
+                    u32::from_ne_bytes(*bytes) == xdg_toplevel::State::Maximized as u32
+                });
+            state.configured_all_tiled = [
+                xdg_toplevel::State::TiledTop,
+                xdg_toplevel::State::TiledBottom,
+                xdg_toplevel::State::TiledLeft,
+                xdg_toplevel::State::TiledRight,
+            ]
+            .into_iter()
+            .all(|edge| {
+                states
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|bytes| u32::from_ne_bytes(*bytes) == edge as u32)
+            });
+            if state.resize_for_configures && width > 0 && height > 0 {
+                state
+                    .viewport
+                    .as_ref()
+                    .unwrap()
+                    .set_destination(width, height);
+            }
+        }
+    }
+}
+delegate_noop!(NativeState: ignore zxdg_decoration_manager_v1::ZxdgDecorationManagerV1);
+delegate_noop!(NativeState: ignore zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1);
+delegate_noop!(NativeState: ignore xdg_wm_dialog_v1::XdgWmDialogV1);
+delegate_noop!(NativeState: ignore xdg_dialog_v1::XdgDialogV1);
+
+delegate_noop!(NativeState: ignore zxdg_exporter_v2::ZxdgExporterV2);
+delegate_noop!(NativeState: ignore zxdg_importer_v2::ZxdgImporterV2);
+delegate_noop!(NativeState: ignore zxdg_imported_v2::ZxdgImportedV2);
+impl Dispatch<zxdg_exported_v2::ZxdgExportedV2, ()> for NativeState {
+    fn event(
+        state: &mut Self,
+        _: &zxdg_exported_v2::ZxdgExportedV2,
+        event: zxdg_exported_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zxdg_exported_v2::Event::Handle { handle } = event {
+            state.exported_handles.push(handle);
+        }
+    }
+}
+
+fn native_window(fixture: &Fixture) -> (EventQueue<NativeState>, NativeState) {
+    native_window_named(
+        fixture,
+        "surviving native window",
+        "swm.disconnect.native",
+        [u32::MAX, 0, 0, u32::MAX],
+    )
+}
+
+fn native_window_named(
+    fixture: &Fixture,
+    title: &str,
+    app_id: &str,
+    rgba: [u32; 4],
+) -> (EventQueue<NativeState>, NativeState) {
+    native_window_named_with_startup_maximize(fixture, title, app_id, rgba, false)
+}
+
+fn native_window_named_with_startup_maximize(
+    fixture: &Fixture,
+    title: &str,
+    app_id: &str,
+    rgba: [u32; 4],
+    startup_maximize: bool,
+) -> (EventQueue<NativeState>, NativeState) {
+    let (mut queue, mut state) = native_connection(fixture);
+    state.resize_for_configures = startup_maximize;
+    let handle = queue.handle();
+    let registry = state.registry.as_ref().unwrap().clone();
+    let compositor: wl_compositor::WlCompositor =
+        registry.bind(state.globals["wl_compositor"], 6, &handle, ());
+    let pixels: pixel::WpSinglePixelBufferManagerV1 = registry.bind(
+        state.globals["wp_single_pixel_buffer_manager_v1"],
+        1,
+        &handle,
+        (),
+    );
+    let viewporter: wp_viewporter::WpViewporter =
+        registry.bind(state.globals["wp_viewporter"], 1, &handle, ());
+    let shell: xdg_wm_base::XdgWmBase = registry.bind(state.globals["xdg_wm_base"], 2, &handle, ());
+    let surface = compositor.create_surface(&handle, ());
+    let manager: fractional_manager::WpFractionalScaleManagerV1 = registry.bind(
+        state.globals["wp_fractional_scale_manager_v1"],
+        1,
+        &handle,
+        (),
+    );
+    let _fractional = manager.get_fractional_scale(&surface, &handle, ());
+    let viewport = viewporter.get_viewport(&surface, &handle, ());
+    viewport.set_destination(240, 160);
+    state.viewport = Some(viewport);
+    let xdg_surface = shell.get_xdg_surface(&surface, &handle, ());
+    let toplevel = xdg_surface.get_toplevel(&handle, ());
+    toplevel.set_title(title.into());
+    toplevel.set_app_id(app_id.into());
+    if startup_maximize {
+        toplevel.set_maximized();
+    }
+    state.toplevel = Some(toplevel);
+    state.buffer =
+        Some(pixels.create_u32_rgba_buffer(rgba[0], rgba[1], rgba[2], rgba[3], &handle, ()));
+    state.surface = Some(surface.clone());
+    surface.commit();
+    queue.roundtrip(&mut state).unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    (queue, state)
+}
+
+fn native_connection(fixture: &Fixture) -> (EventQueue<NativeState>, NativeState) {
+    let socket = fs::read_dir(&fixture.path)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry.file_name().to_string_lossy().starts_with("wayland-")
+                && !entry.file_name().to_string_lossy().ends_with(".lock")
+        })
+        .unwrap()
+        .path();
+    let connection = Connection::from_socket(UnixStream::connect(socket).unwrap()).unwrap();
+    let mut queue = connection.new_event_queue();
+    let handle = queue.handle();
+    let registry = connection.display().get_registry(&handle, ());
+    let mut state = NativeState::default();
+    queue.roundtrip(&mut state).unwrap();
+    state.registry = Some(registry);
+    (queue, state)
+}
+
+fn observe_keyboard(
+    queue: &mut EventQueue<NativeState>,
+    state: &mut NativeState,
+) -> wl_keyboard::WlKeyboard {
+    let seat: wl_seat::WlSeat =
+        state
+            .registry
+            .as_ref()
+            .unwrap()
+            .bind(state.globals["wl_seat"], 1, &queue.handle(), ());
+    let keyboard = seat.get_keyboard(&queue.handle(), ());
+    queue.roundtrip(state).unwrap();
+    keyboard
+}
+
+#[test]
+#[ignore = "requires a Wayland desktop and XWayland; starts an isolated nested compositor"]
+fn closing_portal_dialog_returns_keyboard_focus_to_parent_before_mru_window() {
+    let mut fixture = Fixture::new();
+    let (mut parent_queue, mut parent) = native_window_named(
+        &fixture,
+        "focus parent",
+        "firefox",
+        [u32::MAX, 0, 0, u32::MAX],
+    );
+    let parent_id = fixture.node("focus parent").id;
+    let _keyboard = observe_keyboard(&mut parent_queue, &mut parent);
+    let exporter: zxdg_exporter_v2::ZxdgExporterV2 = parent.registry.as_ref().unwrap().bind(
+        parent.globals["zxdg_exporter_v2"],
+        1,
+        &parent_queue.handle(),
+        (),
+    );
+    let _exported =
+        exporter.export_toplevel(parent.surface.as_ref().unwrap(), &parent_queue.handle(), ());
+    parent_queue.roundtrip(&mut parent).unwrap();
+    thread::sleep(Duration::from_millis(5));
+    let (_other_queue, _other) = native_window_named(
+        &fixture,
+        "focus unrelated",
+        "unrelated",
+        [0, 0, u32::MAX, u32::MAX],
+    );
+    fixture.node("focus unrelated");
+    let (mut dialog_queue, mut dialog) = native_window_named(
+        &fixture,
+        "focus portal dialog",
+        "xdg-desktop-portal-gtk",
+        [0, u32::MAX, 0, u32::MAX],
+    );
+    let dialog_id = fixture.node("focus portal dialog").id;
+    let importer: zxdg_importer_v2::ZxdgImporterV2 = dialog.registry.as_ref().unwrap().bind(
+        dialog.globals["zxdg_importer_v2"],
+        1,
+        &dialog_queue.handle(),
+        (),
+    );
+    let _imported = importer.import_toplevel(
+        parent.exported_handles.last().unwrap().clone(),
+        &dialog_queue.handle(),
+        (),
+    );
+    _imported.set_parent_of(dialog.surface.as_ref().unwrap());
+    dialog_queue.roundtrip(&mut dialog).unwrap();
+    fixture.ack(Request::Node(NodeRequest::Focus {
+        selector: Some(NodeSelector::Id(dialog_id)),
+        output: None,
+    }));
+    parent_queue.roundtrip(&mut parent).unwrap();
+    assert!(!parent.keyboard_focused);
+    // An authoritative unmap, not just a close request or a logical IPC flag.
+    dialog.surface.as_ref().unwrap().attach(None, 0, 0);
+    dialog.surface.as_ref().unwrap().commit();
+    // Do not dispatch the dialog's queued configures, which would remap it.
+    dialog_queue.flush().unwrap();
+    wait_for(
+        "portal close returns real keyboard focus to its parent",
+        || {
+            parent_queue.roundtrip(&mut parent).unwrap();
+            (parent.keyboard_focused
+                && fixture
+                    .nodes()
+                    .iter()
+                    .any(|node| node.id == parent_id && node.focused))
+            .then_some(())
+        },
+    );
+}
+
+#[test]
+#[ignore = "requires a Wayland desktop and XWayland; starts an isolated nested compositor"]
+fn closing_x11_dialog_returns_real_x_focus_to_parent_before_mru_window() {
+    use x11rb::protocol::xproto::PropMode;
+    let mut fixture = Fixture::new();
+    let (x11, _) = RustConnection::connect(Some(&fixture.display)).unwrap();
+    let parent = x11_window(&x11, "X focus parent");
+    let parent_id = fixture.node("X focus parent").id;
+    thread::sleep(Duration::from_millis(5));
+    let _other = x11_window(&x11, "X focus unrelated");
+    let other_id = fixture.node("X focus unrelated").id;
+    let dialog = x11_window(&x11, "X focus dialog");
+    let dialog_id = fixture.node("X focus dialog").id;
+    x11.change_property32(
+        PropMode::REPLACE,
+        dialog,
+        AtomEnum::WM_TRANSIENT_FOR,
+        AtomEnum::WINDOW,
+        &[parent],
+    )
+    .unwrap()
+    .check()
+    .unwrap();
+    x11.flush().unwrap();
+    fixture.ack(Request::Node(NodeRequest::Focus {
+        selector: Some(NodeSelector::Id(parent_id)),
+        output: None,
+    }));
+    let root = x11.setup().roots[0].root;
+    wait_for("X dialog stays above its declared parent", || {
+        let frames = x11.query_tree(root).ok()?.reply().ok()?.children;
+        let parent_frame = x11.query_tree(parent).ok()?.reply().ok()?.parent;
+        let dialog_frame = x11.query_tree(dialog).ok()?.reply().ok()?.parent;
+        (frames.iter().position(|frame| *frame == parent_frame)?
+            < frames.iter().position(|frame| *frame == dialog_frame)?)
+        .then_some(())
+    });
+    thread::sleep(Duration::from_millis(5));
+    fixture.ack(Request::Node(NodeRequest::Focus {
+        selector: Some(NodeSelector::Id(other_id)),
+        output: None,
+    }));
+    thread::sleep(Duration::from_millis(5));
+    fixture.ack(Request::Node(NodeRequest::Focus {
+        selector: Some(NodeSelector::Id(dialog_id)),
+        output: None,
+    }));
+    x11.unmap_window(dialog).unwrap().check().unwrap();
+    x11.flush().unwrap();
+    wait_for("X dialog close restores parent input focus", || {
+        let actual = x11.get_input_focus().ok()?.reply().ok()?.focus;
+        (actual == parent
+            && fixture
+                .nodes()
+                .iter()
+                .any(|node| node.id == parent_id && node.focused))
+        .then_some(())
+    });
+}
+
+#[test]
+#[ignore = "requires a Wayland desktop and XWayland; starts an isolated nested compositor"]
+fn dialog_close_respects_focus_policy_and_parent_availability() {
+    use x11rb::protocol::xproto::PropMode;
+    for case in ["background", "disabled", "collapsed", "destroyed", "nested"] {
+        let extra = if case == "disabled" {
+            "field:\n  close-restore-focus false\nend\n"
+        } else {
+            ""
+        };
+        let mut fixture = Fixture::with_config(extra);
+        let (x11, _) = RustConnection::connect(Some(&fixture.display)).unwrap();
+        let ancestor = x11_window(&x11, "guard ancestor");
+        let ancestor_id = fixture.node("guard ancestor").id;
+        let parent = x11_window(&x11, "guard parent");
+        let parent_id = fixture.node("guard parent").id;
+        let other = x11_window(&x11, "guard unrelated");
+        let other_id = fixture.node("guard unrelated").id;
+        let dialog = x11_window(&x11, "guard dialog");
+        let dialog_id = fixture.node("guard dialog").id;
+        for (child, owner) in [(parent, ancestor), (dialog, parent)] {
+            x11.change_property32(
+                PropMode::REPLACE,
+                child,
+                AtomEnum::WM_TRANSIENT_FOR,
+                AtomEnum::WINDOW,
+                &[owner],
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        }
+        // Round trips on both connections ensure the late parent notification
+        // is handled before testing close succession.
+        x11.flush().unwrap();
+        fixture.ack(Request::Node(NodeRequest::Focus {
+            selector: Some(NodeSelector::Id(parent_id)),
+            output: None,
+        }));
+        let root = x11.setup().roots[0].root;
+        wait_for("guard dialog parent relationship processed", || {
+            let frames = x11.query_tree(root).ok()?.reply().ok()?.children;
+            let parent_frame = x11.query_tree(parent).ok()?.reply().ok()?.parent;
+            let dialog_frame = x11.query_tree(dialog).ok()?.reply().ok()?.parent;
+            (frames.iter().position(|frame| *frame == parent_frame)?
+                < frames.iter().position(|frame| *frame == dialog_frame)?)
+            .then_some(())
+        });
+        if case == "collapsed" || case == "nested" {
+            fixture.ack(Request::Node(NodeRequest::Collapse {
+                selector: Some(NodeSelector::Id(parent_id)),
+                output: None,
+            }));
+        }
+        if case == "collapsed" {
+            fixture.ack(Request::Node(NodeRequest::Collapse {
+                selector: Some(NodeSelector::Id(ancestor_id)),
+                output: None,
+            }));
+        }
+        if case == "destroyed" {
+            x11.destroy_window(parent).unwrap().check().unwrap();
+            x11.destroy_window(ancestor).unwrap().check().unwrap();
+            wait_for("parents removed", || {
+                (!fixture
+                    .nodes()
+                    .iter()
+                    .any(|node| node.id == parent_id || node.id == ancestor_id))
+                .then_some(())
+            });
+        }
+        thread::sleep(Duration::from_millis(5));
+        fixture.ack(Request::Node(NodeRequest::Focus {
+            selector: Some(NodeSelector::Id(other_id)),
+            output: None,
+        }));
+        if case != "background" {
+            thread::sleep(Duration::from_millis(5));
+            fixture.ack(Request::Node(NodeRequest::Focus {
+                selector: Some(NodeSelector::Id(dialog_id)),
+                output: None,
+            }));
+        }
+        x11.unmap_window(dialog).unwrap().check().unwrap();
+        x11.flush().unwrap();
+        wait_for(case, || {
+            let nodes = fixture.nodes();
+            if nodes.iter().any(|node| node.id == dialog_id) {
+                return None;
+            }
+            let actual = x11.get_input_focus().ok()?.reply().ok()?.focus;
+            if case == "disabled" {
+                (!nodes.iter().any(|node| node.focused)
+                    && actual != parent
+                    && actual != ancestor
+                    && actual != other)
+                    .then_some(())
+            } else {
+                let (expected, expected_id) = if case == "nested" {
+                    (ancestor, ancestor_id)
+                } else {
+                    (other, other_id)
+                };
+                (actual == expected
+                    && nodes
+                        .iter()
+                        .any(|node| node.id == expected_id && node.focused)
+                    && nodes
+                        .iter()
+                        .filter(|node| {
+                            node.id == parent_id || (case == "collapsed" && node.id == ancestor_id)
+                        })
+                        .all(|node| {
+                            case != "collapsed" && case != "nested"
+                                || node.state == swm_ipc::NodeState::Node
+                        }))
+                .then_some(())
+            }
+        });
+    }
+}
+
+#[test]
+#[ignore = "requires a Wayland desktop and XWayland; starts an isolated nested compositor"]
+fn display_scale_reload_updates_live_clients_and_native_resolution_capture() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileExt;
+    let mut fixture = Fixture::new();
+    let (mut queue, mut state) = native_window(&fixture);
+    fixture.node("surviving native window");
+    for scale in [1.5, 2.0, 1.0] {
+        fs::write(fixture.path.join("swm.rune"), format!("keybinds:\nend\nview:\n  output:\n    name \"winit\"\n    scale {scale}\n  end\nend\n")).unwrap();
+        fixture.ack(Request::ConfigReload);
+        let output = wait_for("effective scale", || {
+            let Response::Outputs(outputs) = fixture.request(Request::Outputs) else {
+                return None;
+            };
+            outputs
+                .outputs
+                .into_iter()
+                .find(|output| output.scale == scale)
+        });
+        queue.roundtrip(&mut state).unwrap();
+        queue.roundtrip(&mut state).unwrap();
+        assert_eq!(
+            state.fractional_scales.last(),
+            Some(&((scale * 120.0) as u32))
+        );
+        assert_eq!(state.integer_scales.last(), Some(&(scale.ceil() as i32)));
+        let mode = output.modes[output.current_mode.unwrap()];
+        let size = mode.width as usize * mode.height as usize * 4;
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(fixture.path.join(format!("capture-{scale}")))
+            .unwrap();
+        file.set_len(size as u64).unwrap();
+        let request = Request::CaptureFrame(swm_ipc::CaptureFrameRequest {
+            stream_handle: "display-scale-regression".into(),
+            source: swm_ipc::CaptureSource::Monitor {
+                name: output.name,
+                x: 0,
+                y: 0,
+                width: mode.width,
+                height: mode.height,
+            },
+            cursor_mode: swm_ipc::CursorMode::Hidden,
+            buffer: swm_ipc::CaptureBuffer::MemFd {
+                fd_index: 0,
+                offset: 0,
+                size: size as u64,
+                stride: mode.width as u32 * 4,
+            },
+        });
+        let expected = (240.0 * scale).round() as usize;
+        wait_for("native-size captured window", || {
+            let response = fixture
+                .ipc
+                .as_mut()
+                .unwrap()
+                .request(&request, &[file.as_raw_fd()])
+                .unwrap()
+                .response;
+            assert!(matches!(response, Response::Frame(_)), "{response:?}");
+            let mut pixels = vec![0; size];
+            file.read_exact_at(&mut pixels, 0).unwrap();
+            let max_red = pixels
+                .chunks_exact(mode.width as usize * 4)
+                .map(|row| {
+                    row.as_chunks::<4>()
+                        .0
+                        .iter()
+                        .filter(|pixel| pixel[2] > 245 && pixel[1] < 5 && pixel[0] < 5)
+                        .count()
+                })
+                .max()
+                .unwrap();
+            (max_red.abs_diff(expected) <= 2).then_some(())
+        });
+        assert!(fixture.process.try_wait().unwrap().is_none());
+        eprintln!(
+            "scale={scale}: preferred scale and {0}x{1} native capture, window width={expected}",
+            mode.width, mode.height
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a Wayland desktop and XWayland; starts an isolated nested compositor"]
+fn parent_dialog_stacking_survives_focus_and_late_x11_parent_changes() {
+    use x11rb::protocol::xproto::PropMode;
+    let mut fixture = Fixture::new();
+    let (x11, _) = RustConnection::connect(Some(&fixture.display)).unwrap();
+    let parent = x11_window(&x11, "stacking parent");
+    let parent_id = fixture.node("stacking parent").id;
+    let child = x11_window(&x11, "stacking child");
+    fixture.node("stacking child");
+    let grandchild = x11_window(&x11, "stacking grandchild");
+    fixture.node("stacking grandchild");
+    let unrelated = x11_window(&x11, "stacking unrelated");
+    let unrelated_id = fixture.node("stacking unrelated").id;
+    for (window, owner) in [(child, parent), (grandchild, child)] {
+        x11.change_property32(
+            PropMode::REPLACE,
+            window,
+            AtomEnum::WM_TRANSIENT_FOR,
+            AtomEnum::WINDOW,
+            &[owner],
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+    }
+    x11.flush().unwrap();
+    let root = x11.setup().roots[0].root;
+    let assert_stack = |expected: &[u32]| {
+        let mut last = None;
+        wait_for("real X server parent/dialog stack", || {
+            let tree = x11.query_tree(root).ok()?.reply().ok()?;
+            let frames = expected
+                .iter()
+                .map(|window| {
+                    let parent = x11.query_tree(*window).ok()?.reply().ok()?.parent;
+                    Some((if parent == root { *window } else { parent }, *window))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let order = tree
+                .children
+                .into_iter()
+                .filter_map(|frame| {
+                    frames
+                        .iter()
+                        .find(|(id, _)| *id == frame)
+                        .map(|(_, window)| *window)
+                })
+                .collect::<Vec<_>>();
+            if last.as_ref() != Some(&order) {
+                eprintln!("expected X stack {expected:?}, observed {order:?}");
+                last = Some(order.clone());
+            }
+            (order == expected).then_some(())
+        });
+    };
+    assert_stack(&[parent, child, grandchild, unrelated]);
+    // Repeat: deduplicated X stack publishing must still repair each actual
+    // XWM raise, even though the compositor's final order is unchanged.
+    for _ in 0..3 {
+        fixture.ack(Request::Node(NodeRequest::Focus {
+            selector: Some(NodeSelector::Id(parent_id)),
+            output: None,
+        }));
+        assert_stack(&[unrelated, parent, child, grandchild]);
+        assert!(
+            fixture
+                .nodes()
+                .iter()
+                .any(|node| node.id == parent_id && node.focused)
+        );
+    }
+    fixture.ack(Request::Node(NodeRequest::Focus {
+        selector: Some(NodeSelector::Id(unrelated_id)),
+        output: None,
+    }));
+    assert_stack(&[parent, child, grandchild, unrelated]);
+    // Detach, then attach to a different parent after the windows are mapped.
+    x11.delete_property(grandchild, AtomEnum::WM_TRANSIENT_FOR.into())
+        .unwrap()
+        .check()
+        .unwrap();
+    x11.change_property32(
+        PropMode::REPLACE,
+        child,
+        AtomEnum::WM_TRANSIENT_FOR,
+        AtomEnum::WINDOW,
+        &[grandchild],
+    )
+    .unwrap()
+    .check()
+    .unwrap();
+    x11.flush().unwrap();
+    assert_stack(&[parent, grandchild, child, unrelated]);
+    x11.destroy_window(grandchild).unwrap().check().unwrap();
+    x11.flush().unwrap();
+    wait_for("destroyed dialog parent removed", || {
+        (!fixture
+            .nodes()
+            .iter()
+            .any(|node| node.title == "stacking grandchild"))
+        .then_some(())
+    });
+    fixture.ack(Request::Node(NodeRequest::Focus {
+        selector: Some(NodeSelector::Id(parent_id)),
+        output: None,
+    }));
+    assert!(fixture.process.try_wait().unwrap().is_none());
+}
+
+#[test]
+#[ignore = "requires a Wayland desktop and XWayland; starts an isolated nested compositor"]
+fn imported_portal_dialog_stays_visible_above_a_raised_browser() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileExt;
+    let mut fixture = Fixture::new();
+    let (mut browser_queue, mut browser) = native_window_named(
+        &fixture,
+        "portal browser",
+        "firefox",
+        [u32::MAX, 0, 0, u32::MAX],
+    );
+    let parent_id = fixture.node("portal browser").id;
+    let exporter: zxdg_exporter_v2::ZxdgExporterV2 = browser.registry.as_ref().unwrap().bind(
+        browser.globals["zxdg_exporter_v2"],
+        1,
+        &browser_queue.handle(),
+        (),
+    );
+    let _exported = exporter.export_toplevel(
+        browser.surface.as_ref().unwrap(),
+        &browser_queue.handle(),
+        (),
+    );
+    browser_queue.roundtrip(&mut browser).unwrap();
+    let (mut portal_queue, mut portal) = native_window_named(
+        &fixture,
+        "portal save dialog",
+        "xdg-desktop-portal-gtk",
+        [0, u32::MAX, 0, u32::MAX],
+    );
+    let dialog_id = fixture.node("portal save dialog").id;
+    let importer: zxdg_importer_v2::ZxdgImporterV2 = portal.registry.as_ref().unwrap().bind(
+        portal.globals["zxdg_importer_v2"],
+        1,
+        &portal_queue.handle(),
+        (),
+    );
+    let imported = importer.import_toplevel(
+        browser.exported_handles.last().unwrap().clone(),
+        &portal_queue.handle(),
+        (),
+    );
+    imported.set_parent_of(portal.surface.as_ref().unwrap());
+    portal_queue.roundtrip(&mut portal).unwrap();
+    wait_for("cross-client parent visible in IPC", || {
+        fixture.nodes().into_iter().find(|node| {
+            node.id == dialog_id
+                && node
+                    .parent
+                    .as_ref()
+                    .is_some_and(|parent| parent.node_id == Some(parent_id))
+        })
+    });
+    for _ in 0..3 {
+        fixture.ack(Request::Node(NodeRequest::Focus {
+            selector: Some(NodeSelector::Id(parent_id)),
+            output: None,
+        }));
+        browser_queue.roundtrip(&mut browser).unwrap();
+        portal_queue.roundtrip(&mut portal).unwrap();
+    }
+    let Response::Outputs(outputs) = fixture.request(Request::Outputs) else {
+        panic!("missing outputs")
+    };
+    let output = &outputs.outputs[0];
+    let mode = output.modes[output.current_mode.unwrap()];
+    let size = mode.width as usize * mode.height as usize * 4;
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(fixture.path.join("portal-stack-capture"))
+        .unwrap();
+    file.set_len(size as u64).unwrap();
+    let request = Request::CaptureFrame(swm_ipc::CaptureFrameRequest {
+        stream_handle: "portal-parent-stacking".into(),
+        source: swm_ipc::CaptureSource::Monitor {
+            name: output.name.clone(),
+            x: 0,
+            y: 0,
+            width: mode.width,
+            height: mode.height,
+        },
+        cursor_mode: swm_ipc::CursorMode::Hidden,
+        buffer: swm_ipc::CaptureBuffer::MemFd {
+            fd_index: 0,
+            offset: 0,
+            size: size as u64,
+            stride: mode.width as u32 * 4,
+        },
+    });
+    wait_for(
+        "portal dialog visible after repeatedly raising browser",
+        || {
+            let response = fixture
+                .ipc
+                .as_mut()
+                .unwrap()
+                .request(&request, &[file.as_raw_fd()])
+                .unwrap()
+                .response;
+            assert!(matches!(response, Response::Frame(_)), "{response:?}");
+            let mut pixels = vec![0; size];
+            file.read_exact_at(&mut pixels, 0).unwrap();
+            let green = pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[1] > 245 && p[0] < 5 && p[2] < 5)
+                .count();
+            // Both client rectangles overlap at the viewport center. A buried
+            // dialog loses its green interior underneath the opaque red browser.
+            (green > 30_000).then_some(())
+        },
+    );
+    imported.destroy();
+    portal_queue.roundtrip(&mut portal).unwrap();
+    wait_for("import teardown removes parent", || {
+        fixture
+            .nodes()
+            .into_iter()
+            .find(|node| node.id == dialog_id && node.parent.is_none())
+    });
+    assert!(fixture.process.try_wait().unwrap().is_none());
+}
+
+fn import_native_parent(
+    parent_queue: &mut EventQueue<NativeState>,
+    parent: &mut NativeState,
+    child_queue: &mut EventQueue<NativeState>,
+    child: &mut NativeState,
+) -> zxdg_imported_v2::ZxdgImportedV2 {
+    let exporter: zxdg_exporter_v2::ZxdgExporterV2 = parent.registry.as_ref().unwrap().bind(
+        parent.globals["zxdg_exporter_v2"],
+        1,
+        &parent_queue.handle(),
+        (),
+    );
+    let _exported =
+        exporter.export_toplevel(parent.surface.as_ref().unwrap(), &parent_queue.handle(), ());
+    parent_queue.roundtrip(parent).unwrap();
+    let importer: zxdg_importer_v2::ZxdgImporterV2 = child.registry.as_ref().unwrap().bind(
+        child.globals["zxdg_importer_v2"],
+        1,
+        &child_queue.handle(),
+        (),
+    );
+    let imported = importer.import_toplevel(
+        parent.exported_handles.last().unwrap().clone(),
+        &child_queue.handle(),
+        (),
+    );
+    imported.set_parent_of(child.surface.as_ref().unwrap());
+    child_queue.roundtrip(child).unwrap();
+    imported
+}
+
+fn native_dialog_hint(
+    queue: &mut EventQueue<NativeState>,
+    state: &mut NativeState,
+) -> (xdg_wm_dialog_v1::XdgWmDialogV1, xdg_dialog_v1::XdgDialogV1) {
+    let manager: xdg_wm_dialog_v1::XdgWmDialogV1 = state.registry.as_ref().unwrap().bind(
+        state.globals["xdg_wm_dialog_v1"],
+        1,
+        &queue.handle(),
+        (),
+    );
+    let dialog = manager.get_xdg_dialog(state.toplevel.as_ref().unwrap(), &queue.handle(), ());
+    queue.roundtrip(state).unwrap();
+    (manager, dialog)
+}
+
+fn assert_native_focus(
+    fixture: &mut Fixture,
+    id: u64,
+    queue: &mut EventQueue<NativeState>,
+    state: &mut NativeState,
+) {
+    wait_for("matching real keyboard and compositor focus", || {
+        queue.roundtrip(state).unwrap();
+        (state.keyboard_focused
+            && fixture
+                .nodes()
+                .iter()
+                .any(|node| node.id == id && node.focused))
+        .then_some(())
+    });
+}
+
+fn request_native_focus(fixture: &mut Fixture, id: u64) {
+    fixture.ack(Request::Node(NodeRequest::Focus {
+        selector: Some(NodeSelector::Id(id)),
+        output: None,
+    }));
+}
+
+#[test]
+#[ignore = "requires a Wayland desktop and XWayland; starts an isolated nested compositor"]
+fn xdg_dialog_modal_focus_tracks_hints_and_cross_client_parent_lifetime() {
+    let mut fixture = Fixture::new();
+    let (mut parent_queue, mut parent) = native_window_named(
+        &fixture,
+        "modal parent",
+        "firefox",
+        [u32::MAX, 0, 0, u32::MAX],
+    );
+    let parent_id = fixture.node("modal parent").id;
+    let _parent_keyboard = observe_keyboard(&mut parent_queue, &mut parent);
+    let (mut other_queue, mut other) = native_window_named(
+        &fixture,
+        "modal unrelated",
+        "unrelated",
+        [0, 0, u32::MAX, u32::MAX],
+    );
+    let other_id = fixture.node("modal unrelated").id;
+    let _other_keyboard = observe_keyboard(&mut other_queue, &mut other);
+    let (mut child_queue, mut child) = native_window_named(
+        &fixture,
+        "modal portal dialog",
+        "xdg-desktop-portal-gtk",
+        [0, u32::MAX, 0, u32::MAX],
+    );
+    let child_id = fixture.node("modal portal dialog").id;
+    let _child_keyboard = observe_keyboard(&mut child_queue, &mut child);
+    let imported =
+        import_native_parent(&mut parent_queue, &mut parent, &mut child_queue, &mut child);
+    let (manager, dialog) = native_dialog_hint(&mut child_queue, &mut child);
+    request_native_focus(&mut fixture, parent_id);
+    assert_native_focus(&mut fixture, parent_id, &mut parent_queue, &mut parent);
+    // A late modal hint applies to the focused family immediately.
+    dialog.set_modal();
+    child_queue.roundtrip(&mut child).unwrap();
+    assert_native_focus(&mut fixture, child_id, &mut child_queue, &mut child);
+    assert!(fixture.node("modal portal dialog").modal);
+    parent_queue.roundtrip(&mut parent).unwrap();
+    assert!(!parent.keyboard_focused);
+    request_native_focus(&mut fixture, other_id);
+    assert_native_focus(&mut fixture, other_id, &mut other_queue, &mut other);
+    request_native_focus(&mut fixture, parent_id);
+    assert_native_focus(&mut fixture, child_id, &mut child_queue, &mut child);
+    dialog.unset_modal();
+    child_queue.roundtrip(&mut child).unwrap();
+    assert!(!fixture.node("modal portal dialog").modal);
+    request_native_focus(&mut fixture, parent_id);
+    assert_native_focus(&mut fixture, parent_id, &mut parent_queue, &mut parent);
+    request_native_focus(&mut fixture, other_id);
+    dialog.set_modal();
+    manager.destroy();
+    child_queue.roundtrip(&mut child).unwrap();
+    assert_native_focus(&mut fixture, other_id, &mut other_queue, &mut other);
+    request_native_focus(&mut fixture, parent_id);
+    assert_native_focus(&mut fixture, child_id, &mut child_queue, &mut child);
+    dialog.destroy();
+    child_queue.roundtrip(&mut child).unwrap();
+    request_native_focus(&mut fixture, parent_id);
+    assert_native_focus(&mut fixture, parent_id, &mut parent_queue, &mut parent);
+    let (_manager, dialog) = native_dialog_hint(&mut child_queue, &mut child);
+    dialog.set_modal();
+    child_queue.roundtrip(&mut child).unwrap();
+    assert_native_focus(&mut fixture, child_id, &mut child_queue, &mut child);
+    // Removing an imported parent makes the remaining modal hint ineffective.
+    imported.destroy();
+    child_queue.roundtrip(&mut child).unwrap();
+    request_native_focus(&mut fixture, parent_id);
+    assert_native_focus(&mut fixture, parent_id, &mut parent_queue, &mut parent);
+    // Restoring the relationship to an already-modal child redirects the
+    // focused parent immediately, without another focus request.
+    let _reimported =
+        import_native_parent(&mut parent_queue, &mut parent, &mut child_queue, &mut child);
+    assert_native_focus(&mut fixture, child_id, &mut child_queue, &mut child);
+    parent.toplevel.as_ref().unwrap().set_fullscreen(None);
+    parent_queue.roundtrip(&mut parent).unwrap();
+    request_native_focus(&mut fixture, parent_id);
+    assert_native_focus(&mut fixture, child_id, &mut child_queue, &mut child);
+    // A real null-buffer unmap clears the restriction and restores parent
+    // keyboard focus. Do not dispatch configures that would remap the child.
+    child.surface.as_ref().unwrap().attach(None, 0, 0);
+    child.surface.as_ref().unwrap().commit();
+    child_queue.flush().unwrap();
+    assert_native_focus(&mut fixture, parent_id, &mut parent_queue, &mut parent);
+}
+
+#[test]
+#[ignore = "requires a Wayland desktop and XWayland; starts an isolated nested compositor"]
+fn xdg_dialog_nested_and_collapsed_children_do_not_strand_keyboard_focus() {
+    let mut fixture = Fixture::new();
+    let (mut parent_queue, mut parent) = native_window_named(
+        &fixture,
+        "nested modal parent",
+        "firefox",
+        [u32::MAX, 0, 0, u32::MAX],
+    );
+    let parent_id = fixture.node("nested modal parent").id;
+    let _parent_keyboard = observe_keyboard(&mut parent_queue, &mut parent);
+    let (mut child_queue, mut child) = native_window_named(
+        &fixture,
+        "nested modal child",
+        "portal",
+        [0, u32::MAX, 0, u32::MAX],
+    );
+    let child_id = fixture.node("nested modal child").id;
+    let _child_keyboard = observe_keyboard(&mut child_queue, &mut child);
+    let _parent_import =
+        import_native_parent(&mut parent_queue, &mut parent, &mut child_queue, &mut child);
+    let (_manager, dialog) = native_dialog_hint(&mut child_queue, &mut child);
+    dialog.set_modal();
+    child_queue.roundtrip(&mut child).unwrap();
+    let (mut nested_queue, mut nested) = native_window_named(
+        &fixture,
+        "nested modal grandchild",
+        "portal",
+        [0, 0, u32::MAX, u32::MAX],
+    );
+    let nested_id = fixture.node("nested modal grandchild").id;
+    let _nested_keyboard = observe_keyboard(&mut nested_queue, &mut nested);
+    let _nested_import =
+        import_native_parent(&mut child_queue, &mut child, &mut nested_queue, &mut nested);
+    let (_nested_manager, nested_dialog) = native_dialog_hint(&mut nested_queue, &mut nested);
+    nested_dialog.set_modal();
+    nested_queue.roundtrip(&mut nested).unwrap();
+    request_native_focus(&mut fixture, parent_id);
+    assert_native_focus(&mut fixture, nested_id, &mut nested_queue, &mut nested);
+    fixture.ack(Request::Node(NodeRequest::Collapse {
+        selector: Some(NodeSelector::Id(nested_id)),
+        output: None,
+    }));
+    request_native_focus(&mut fixture, parent_id);
+    assert_native_focus(&mut fixture, child_id, &mut child_queue, &mut child);
+    fixture.ack(Request::Node(NodeRequest::Collapse {
+        selector: Some(NodeSelector::Id(child_id)),
+        output: None,
+    }));
+    request_native_focus(&mut fixture, parent_id);
+    assert_native_focus(&mut fixture, parent_id, &mut parent_queue, &mut parent);
+}
+
+fn capture_green_chrome(fixture: &mut Fixture) -> (usize, Option<[usize; 4]>) {
+    capture_colour_bounds(fixture)[1]
+}
+
+fn capture_frame_pixels(fixture: &mut Fixture) -> (Vec<u8>, usize) {
+    capture_frame_pixels_on(fixture, None)
+}
+
+fn capture_frame_pixels_on(fixture: &mut Fixture, name: Option<&str>) -> (Vec<u8>, usize) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileExt;
+    let Response::Outputs(outputs) = fixture.request(Request::Outputs) else {
+        panic!("missing outputs")
+    };
+    let output = name.map_or(&outputs.outputs[0], |name| {
+        outputs
+            .outputs
+            .iter()
+            .find(|o| o.name == name)
+            .expect("requested capture output")
+    });
+    let mode = output.modes[output.current_mode.unwrap()];
+    let size = mode.width as usize * mode.height as usize * 4;
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(fixture.path.join("fullscreen-chrome-capture"))
+        .unwrap();
+    file.set_len(size as u64).unwrap();
+    let request = Request::CaptureFrame(swm_ipc::CaptureFrameRequest {
+        stream_handle: "fullscreen-chrome-regression".into(),
+        source: swm_ipc::CaptureSource::Monitor {
+            name: output.name.clone(),
+            x: 0,
+            y: 0,
+            width: mode.width,
+            height: mode.height,
+        },
+        cursor_mode: swm_ipc::CursorMode::Hidden,
+        buffer: swm_ipc::CaptureBuffer::MemFd {
+            fd_index: 0,
+            offset: 0,
+            size: size as u64,
+            stride: mode.width as u32 * 4,
+        },
+    });
+    let response = fixture
+        .ipc
+        .as_mut()
+        .unwrap()
+        .request(&request, &[file.as_raw_fd()])
+        .unwrap()
+        .response;
+    assert!(matches!(response, Response::Frame(_)), "{response:?}");
+    let mut pixels = vec![0; size];
+    file.read_exact_at(&mut pixels, 0).unwrap();
+    (pixels, mode.width as usize)
+}
+
+fn capture_colour_bounds(fixture: &mut Fixture) -> [(usize, Option<[usize; 4]>); 3] {
+    let (pixels, width) = capture_frame_pixels(fixture);
+    std::array::from_fn(|channel| {
+        let mut count = 0;
+        let mut min_x = usize::MAX;
+        let mut min_y = usize::MAX;
+        let mut max_x = 0;
+        let mut max_y = 0;
+        let (other_a, other_b) = [(1, 2), (0, 2), (0, 1)][channel];
+        let threshold = if channel == 1 { 64 } else { 8 };
+        for (index, p) in pixels.as_chunks::<4>().0.iter().enumerate() {
+            // Detect partially faded green chrome too, not just its opaque endpoint.
+            let other = p[other_a].max(p[other_b]);
+            if p[channel] > threshold
+                && u16::from(p[channel]) > u16::from(other) + 32
+                && (channel == 1 || other < 32)
+            {
+                let x = index % width;
+                let y = index / width;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+                count += 1;
+            }
+        }
+        (count, (count > 0).then_some([min_x, min_y, max_x, max_y]))
+    })
+}
+
+fn count_green_capture_pixels(fixture: &mut Fixture) -> usize {
+    capture_green_chrome(fixture).0
+}
+
+#[test]
+#[ignore = "requires a Wayland desktop and XWayland; confines only an isolated X11 client's pointer"]
+fn x11_pointer_confinement_finishes_fullscreen_and_preserves_live_frames() {
+    use x11rb::protocol::xproto::{
+        ChangeWindowAttributesAux, ClientMessageEvent, EventMask, GrabMode, GrabStatus,
+    };
+    let mut fixture = Fixture::with_config(
+        r#"
+animations:
+  window-open:
+    enabled false
+  end
+  fullscreen:
+    motion "easing"
+    duration-ms 4000
+    curve "linear"
+  end
+end
+"#,
+    );
+    let (x11, _) = x11rb::connect(Some(&fixture.display)).unwrap();
+    let window = x11_window(&x11, "confined fullscreen regression");
+    fixture.node("confined fullscreen regression");
+    x11.change_window_attributes(
+        window,
+        &ChangeWindowAttributesAux::new().background_pixel(0xff0000),
+    )
+    .unwrap()
+    .check()
+    .unwrap();
+    x11.clear_area(false, window, 0, 0, 0, 0).unwrap();
+    x11.flush().unwrap();
+    thread::sleep(Duration::from_millis(250));
+    let Response::Outputs(outputs) = fixture.request(Request::Outputs) else {
+        panic!("missing outputs")
+    };
+    let output = &outputs.outputs[0];
+    let mode = output.modes[output.current_mode.unwrap()];
+    let wm_state = x11
+        .intern_atom(false, b"_NET_WM_STATE")
+        .unwrap()
+        .reply()
+        .unwrap()
+        .atom;
+    let fullscreen = x11
+        .intern_atom(false, b"_NET_WM_STATE_FULLSCREEN")
+        .unwrap()
+        .reply()
+        .unwrap()
+        .atom;
+    x11.send_event(
+        false,
+        x11.setup().roots[0].root,
+        EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+        ClientMessageEvent::new(32, window, wm_state, [1, fullscreen, 0, 1, 0]),
+    )
+    .unwrap();
+    x11.flush().unwrap();
+    wait_for("resized X11 allocation", || {
+        let geometry = x11.get_geometry(window).unwrap().reply().unwrap();
+        (i32::from(geometry.width) == mode.width && i32::from(geometry.height) == mode.height)
+            .then_some(())
+    });
+    // Supply a complete repaint, then catch the compositor mid-animation.
+    x11.clear_area(false, window, 0, 0, 0, 0).unwrap();
+    x11.flush().unwrap();
+    wait_for("running fullscreen animation", || {
+        let bounds = capture_colour_bounds(&mut fixture)[2].1?;
+        let width = bounds[2] - bounds[0] + 1;
+        (width > 300 && width < mode.width as usize - 100).then_some(())
+    });
+
+    let grab = x11
+        .grab_pointer(
+            false,
+            window,
+            EventMask::POINTER_MOTION,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+            window,
+            x11rb::NONE,
+            x11rb::CURRENT_TIME,
+        )
+        .unwrap()
+        .reply()
+        .unwrap();
+    assert_eq!(grab.status, GrabStatus::SUCCESS);
+    let forced_at = Instant::now();
+    loop {
+        let bounds = capture_colour_bounds(&mut fixture)[2].1;
+        if bounds.is_some_and(|b| {
+            b[2] - b[0] + 1 == mode.width as usize && b[3] - b[1] + 1 == mode.height as usize
+        }) {
+            break;
+        }
+        assert!(
+            forced_at.elapsed() < Duration::from_secs(1),
+            "confinement must finish the four-second transition immediately"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    // The completed presentation must continue showing fresh client content.
+    x11.ungrab_pointer(x11rb::CURRENT_TIME).unwrap();
+    x11.change_window_attributes(
+        window,
+        &ChangeWindowAttributesAux::new().background_pixel(0x0000ff),
+    )
+    .unwrap()
+    .check()
+    .unwrap();
+    x11.clear_area(false, window, 0, 0, 0, 0).unwrap();
+    x11.flush().unwrap();
+    wait_for("live blue frame after forced completion", || {
+        let colours = capture_colour_bounds(&mut fixture);
+        (colours[0].0 > mode.width as usize * mode.height as usize / 2 && colours[2].0 == 0)
+            .then_some(())
+    });
+    assert!(fixture.process.try_wait().unwrap().is_none());
+}
+
+#[test]
+#[ignore = "requires a Wayland desktop and XWayland; checks startup maximize sizing"]
+fn startup_maximize_uses_a_windowed_fallback_and_preserves_initial_size_rules() {
+    for rule in [None, Some((720, 520))] {
+        let extra = rule.map_or_else(String::new, |(width, height)| {
+            format!("rules:\n  window-rule:\n    app-id \"swm.startup-size\"\n    width {width}\n    height {height}\n  end\nend\n")
+        });
+        let mut fixture = Fixture::with_config(&extra);
+        let Response::Outputs(outputs) = fixture.request(Request::Outputs) else {
+            panic!("missing outputs");
+        };
+        let output = &outputs.outputs[0];
+        let mode = output.modes[output.current_mode.unwrap()];
+        let expected = rule.unwrap_or((mode.width * 3 / 4, mode.height * 3 / 4));
+        let (_queue, state) = native_window_named_with_startup_maximize(
+            &fixture,
+            "startup maximized window",
+            "swm.startup-size",
+            [u32::MAX, 0, 0, u32::MAX],
+            true,
+        );
+        assert_eq!(state.first_configured_size, Some(expected));
+        assert!(!state.configured_fullscreen);
+        assert!(!state.configured_maximized);
+        fixture.node("startup maximized window");
+    }
+}
+
+#[test]
+#[ignore = "requires a Wayland desktop and XWayland; checks native fullscreen decoration hints"]
+fn compositor_fullscreen_preserves_square_client_corners_across_nested_fullscreen() {
+    let mut fixture = Fixture::with_config("animations:\n  enabled false\nend\n");
+    let (mut queue, mut state) = native_window_named(
+        &fixture,
+        "fullscreen client corners",
+        "swm.fullscreen.client-corners",
+        [u32::MAX, 0, 0, u32::MAX],
+    );
+    fixture.node("fullscreen client corners");
+    state.resize_for_configures = true;
+    let _manager: foreign_manager::ZwlrForeignToplevelManagerV1 =
+        state.registry.as_ref().unwrap().bind(
+            state.globals["zwlr_foreign_toplevel_manager_v1"],
+            3,
+            &queue.handle(),
+            (),
+        );
+    let handle = wait_for("foreign toplevel handle", || {
+        queue.roundtrip(&mut state).unwrap();
+        state.foreign_toplevel.clone()
+    });
+    let before = state.configure_count;
+    handle.set_fullscreen(None); // Same compositor action as Mod+F.
+    wait_for("compositor fullscreen configure", || {
+        queue.roundtrip(&mut state).unwrap();
+        (state.configure_count > before && state.configured_size.0 > 240).then_some(())
+    });
+    assert!(!state.configured_fullscreen);
+    assert!(
+        state.configured_all_tiled,
+        "Mod+F must keep client corners square"
+    );
+
+    let before = state.configure_count;
+    state.toplevel.as_ref().unwrap().set_fullscreen(None); // Client F11.
+    wait_for("nested client fullscreen configure", || {
+        queue.roundtrip(&mut state).unwrap();
+        (state.configure_count > before && state.configured_fullscreen).then_some(())
+    });
+    assert!(!state.configured_all_tiled);
+
+    let fullscreen_size = state.configured_size;
+    let before = state.configure_count;
+    state.toplevel.as_ref().unwrap().unset_fullscreen();
+    wait_for("nested client fullscreen exit configure", || {
+        queue.roundtrip(&mut state).unwrap();
+        (state.configure_count > before && !state.configured_fullscreen).then_some(())
+    });
+    assert_eq!(state.configured_size, fullscreen_size);
+    assert!(
+        state.configured_all_tiled,
+        "leaving F11 under Mod+F must restore square client corners"
+    );
+
+    let before = state.configure_count;
+    handle.unset_fullscreen();
+    wait_for("windowed configure", || {
+        queue.roundtrip(&mut state).unwrap();
+        (state.configure_count > before && state.configured_size != fullscreen_size).then_some(())
+    });
+    assert!(!state.configured_fullscreen);
+    assert!(state.configured_all_tiled);
+}
+
+#[test]
+#[ignore = "requires a Wayland desktop and XWayland; starts an isolated nested compositor"]
+fn compositor_fullscreen_exit_releases_an_idle_client_that_keeps_its_buffer_size() {
+    let mut fixture = Fixture::with_config(
+        r#"
+animations:
+  window-open:
+    enabled false
+  end
+  fullscreen:
+    motion "easing"
+    duration-ms 100
+    curve "linear"
+  end
+end
+"#,
+    );
+    let (mut queue, mut state) = native_window_named(
+        &fixture,
+        "fixed fullscreen endpoint",
+        "swm.fixed-endpoint.regression",
+        [u32::MAX, 0, 0, u32::MAX],
+    );
+    fixture.node("fixed fullscreen endpoint");
+    state.resize_for_configures = true;
+    let _manager: foreign_manager::ZwlrForeignToplevelManagerV1 =
+        state.registry.as_ref().unwrap().bind(
+            state.globals["zwlr_foreign_toplevel_manager_v1"],
+            3,
+            &queue.handle(),
+            (),
+        );
+    wait_for("foreign toplevel handle", || {
+        queue.roundtrip(&mut state).unwrap();
+        state.foreign_toplevel.clone()
+    });
+    let handle = state.foreign_toplevel.clone().unwrap();
+    let before_enter = state.configure_count;
+    // This reaches the same set_record_fullscreen path as the Mod+F binding.
+    handle.set_fullscreen(None);
+    wait_for("compositor fullscreen configure", || {
+        queue.roundtrip(&mut state).unwrap();
+        (state.configure_count > before_enter && state.configured_size.0 > 240).then_some(())
+    });
+    queue.roundtrip(&mut state).unwrap();
+    assert!(
+        !state.configured_fullscreen,
+        "compositor fullscreen must preserve protocol ownership"
+    );
+    thread::sleep(Duration::from_millis(350));
+
+    // Acknowledge exit while keeping the fullscreen viewport/buffer. After
+    // that response the client goes idle, without another wl_surface.commit.
+    state.resize_for_configures = false;
+    let before_exit = state.configure_count;
+    let fullscreen_size = state.configured_size;
+    handle.unset_fullscreen();
+    wait_for("windowed restore configure", || {
+        queue.roundtrip(&mut state).unwrap();
+        (state.configure_count > before_exit && state.configured_size != fullscreen_size)
+            .then_some(())
+    });
+    queue.roundtrip(&mut state).unwrap();
+    thread::sleep(Duration::from_millis(600));
+    assert!(
+        matches!(
+            fixture.request(Request::Control(swm_ipc::ControlRequest::PanField(
+                swm_ipc::ControlDirection::Right,
+            ))),
+            Response::Ack
+        ),
+        "the idle, acknowledged client must release the fullscreen camera lock"
+    );
+    assert!(fixture.process.try_wait().unwrap().is_none());
+}
+
+#[test]
+#[ignore = "requires a Wayland desktop and XWayland; captures an isolated compositor's chrome"]
+fn fullscreen_exit_fades_the_attached_frame_near_the_end_of_the_return() {
+    fullscreen_exit_chrome_regression(false);
+}
+
+#[test]
+#[ignore = "manual visual preview; runs Kitty fullscreen/maximize cycles in an isolated compositor"]
+fn shared_bounds_visual_preview() {
+    struct PreviewClient(Child);
+    impl Drop for PreviewClient {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut fixture = Fixture::with_config(
+        r#"
+animations:
+  window-open:
+    enabled false
+  end
+  fullscreen:
+    motion "easing"
+    duration-ms 1000
+    curve "ease-in-out-cubic"
+  end
+  maximize:
+    motion "easing"
+    duration-ms 1000
+    curve "ease-in-out-cubic"
+  end
+end
+"#,
+    );
+    let (mut queue, mut state) = native_connection(&fixture);
+    let _manager: foreign_manager::ZwlrForeignToplevelManagerV1 =
+        state.registry.as_ref().unwrap().bind(
+            state.globals["zwlr_foreign_toplevel_manager_v1"],
+            3,
+            &queue.handle(),
+            (),
+        );
+    let socket = fs::read_dir(&fixture.path)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry.file_name().to_string_lossy().starts_with("wayland-")
+                && !entry.file_name().to_string_lossy().ends_with(".lock")
+        })
+        .unwrap()
+        .path();
+    let log = File::create(fixture.path.join("kitty.log")).unwrap();
+    let mut kitty = PreviewClient(Command::new("kitty")
+        .args(["--config", "NONE", "--title", "SWM blend preview",
+            "-o", "linux_display_server=wayland", "-o", "confirm_os_window_close=0",
+            "-o", "remember_window_size=no", "-o", "initial_window_width=720",
+            "-o", "initial_window_height=440", "-o", "font_size=15",
+            "-o", "background_opacity=0.90", "--hold", "sh", "-c",
+            r#"printf '\033[1;36mSHARED RECTANGLE BLEND PREVIEW\033[0m\n\n'; printf 'Fullscreen and maximize, then restore.\nWatch the window edge and text as the size changes.\n\n'; i=1; while [ $i -le 16 ]; do printf '\033[3%sm%02d  The quick brown fox | 0123456789 | SWM\033[0m\n' $((i % 6 + 1)) $i; i=$((i + 1)); done"#])
+        .env("WAYLAND_DISPLAY", socket).env("XDG_RUNTIME_DIR", &fixture.path)
+        .env_remove("DISPLAY").env_remove("WAYLAND_SOCKET")
+        .stdout(Stdio::from(log.try_clone().unwrap())).stderr(Stdio::from(log))
+        .spawn().unwrap());
+    let handle = wait_for("Kitty preview toplevel", || {
+        queue.roundtrip(&mut state).unwrap();
+        state.foreign_titles.get("SWM blend preview").cloned()
+    });
+    eprintln!(
+        "Preview nested PID={}, runtime={}",
+        fixture.process.id(),
+        fixture.path.display()
+    );
+    thread::sleep(Duration::from_secs(4));
+    for cycle in 0..5 {
+        for (fullscreen, enabled) in [(true, true), (true, false), (false, true), (false, false)] {
+            match (fullscreen, enabled) {
+                (true, true) => handle.set_fullscreen(None),
+                (true, false) => handle.unset_fullscreen(),
+                (false, true) => handle.set_maximized(),
+                (false, false) => handle.unset_maximized(),
+            }
+            queue.roundtrip(&mut state).unwrap();
+            if cycle == 0 && fullscreen && enabled {
+                thread::sleep(Duration::from_millis(500));
+                let (mut pixels, width) = capture_frame_pixels(&mut fixture);
+                for pixel in pixels.as_chunks_mut::<4>().0.iter_mut() {
+                    pixel.swap(0, 2);
+                }
+                let image_path = std::env::temp_dir().join("swm-shared-bounds-preview.png");
+                image::save_buffer(
+                    &image_path,
+                    &pixels,
+                    width as u32,
+                    (pixels.len() / 4 / width) as u32,
+                    image::ColorType::Rgba8,
+                )
+                .unwrap();
+                eprintln!("Preview frame: {}", image_path.display());
+                thread::sleep(Duration::from_millis(1100));
+            } else {
+                thread::sleep(Duration::from_millis(1600));
+            }
+            assert!(fixture.process.try_wait().unwrap().is_none());
+            assert!(kitty.0.try_wait().unwrap().is_none());
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a Wayland desktop and XWayland; captures live fullscreen surface-tree changes"]
+fn fullscreen_capture_reuse_preserves_root_child_and_removal_updates() {
+    let mut fixture = Fixture::with_config(
+        r#"
+decorations:
+  border:
+    size 0
+  end
+end
+animations:
+  window-open:
+    enabled false
+  end
+  fullscreen:
+    motion "easing"
+    duration-ms 12000
+    curve "linear"
+  end
+end
+"#,
+    );
+    let (mut queue, mut state) = native_window_named(
+        &fixture,
+        "fullscreen live tree",
+        "swm.fullscreen.live-tree",
+        [0, 0, 0, u32::MAX],
+    );
+    fixture.node("fullscreen live tree");
+    state.resize_for_configures = true;
+    state.toplevel.as_ref().unwrap().set_fullscreen(None);
+    wait_for("fullscreen configure for live-tree test", || {
+        queue.roundtrip(&mut state).unwrap();
+        state.configured_fullscreen.then_some(())
+    });
+    let started = Instant::now();
+    // Hold one unchanged endpoint for many frames, then update it while the
+    // crossfade is still active and its incoming colour is readily visible.
+    thread::sleep(Duration::from_millis(3500));
+    let handle = queue.handle();
+    let registry = state.registry.as_ref().unwrap();
+    let pixels: pixel::WpSinglePixelBufferManagerV1 = registry.bind(
+        state.globals["wp_single_pixel_buffer_manager_v1"],
+        1,
+        &handle,
+        (),
+    );
+    let compositor: wl_compositor::WlCompositor =
+        registry.bind(state.globals["wl_compositor"], 6, &handle, ());
+    let subcompositor: wl_subcompositor::WlSubcompositor =
+        registry.bind(state.globals["wl_subcompositor"], 1, &handle, ());
+    let viewporter: wp_viewporter::WpViewporter =
+        registry.bind(state.globals["wp_viewporter"], 1, &handle, ());
+    let blue = pixels.create_u32_rgba_buffer(0, 0, u32::MAX, u32::MAX, &handle, ());
+    let green = pixels.create_u32_rgba_buffer(0, u32::MAX, 0, u32::MAX, &handle, ());
+    let red = pixels.create_u32_rgba_buffer(u32::MAX, 0, 0, u32::MAX, &handle, ());
+    let root = state.surface.as_ref().unwrap().clone();
+    state.buffer = Some(blue.clone());
+    root.attach(Some(&blue), 0, 0);
+    root.damage_buffer(0, 0, i32::MAX, i32::MAX);
+    root.commit();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for("root repaint during cached fullscreen blend", || {
+        (capture_colour_bounds(&mut fixture)[0].0 > 1000).then_some(())
+    });
+
+    let child = compositor.create_surface(&handle, ());
+    let subsurface = subcompositor.get_subsurface(&child, &root, &handle, ());
+    subsurface.set_desync();
+    subsurface.set_position(40, 40);
+    let viewport = viewporter.get_viewport(&child, &handle, ());
+    viewport.set_destination(120, 80);
+    child.attach(Some(&green), 0, 0);
+    child.damage_buffer(0, 0, i32::MAX, i32::MAX);
+    child.commit();
+    root.commit();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for("new child during fullscreen blend", || {
+        (capture_colour_bounds(&mut fixture)[1].0 > 100).then_some(())
+    });
+
+    // No root commit: its damage counter cannot invalidate these changes.
+    child.attach(Some(&red), 0, 0);
+    child.damage_buffer(0, 0, i32::MAX, i32::MAX);
+    child.commit();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for("independent child repaint during fullscreen blend", || {
+        let colours = capture_colour_bounds(&mut fixture);
+        (colours[2].0 > 100 && colours[1].0 == 0).then_some(())
+    });
+    child.attach(Some(&green), 0, 0);
+    child.damage_buffer(0, 0, i32::MAX, i32::MAX);
+    child.commit();
+    queue.roundtrip(&mut state).unwrap();
+    let full_child_pixels = wait_for("restored green child", || {
+        let count = capture_colour_bounds(&mut fixture)[1].0;
+        (count > 100).then_some(count)
+    });
+    // Viewport-only commit, with no buffer attachment or damage.
+    viewport.set_destination(60, 40);
+    child.commit();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for("child viewport change without repaint", || {
+        let count = capture_colour_bounds(&mut fixture)[1].0;
+        (count > 20 && count < full_child_pixels / 2).then_some(())
+    });
+
+    // Destroying the subsurface role unparents it immediately; there is no
+    // parent or child wl_surface commit to notify the fullscreen transaction.
+    subsurface.destroy();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for("removed child disappears from fullscreen capture", || {
+        let colours = capture_colour_bounds(&mut fixture);
+        (colours[1].0 == 0 && colours[0].0 > 1000).then_some(())
+    });
+    assert!(
+        started.elapsed() < Duration::from_secs(11),
+        "updates must be visible during the blend, before returning to live rendering"
+    );
+    assert!(fixture.process.try_wait().unwrap().is_none());
+}
+
+#[test]
+#[ignore = "requires a Wayland desktop and XWayland; captures fullscreen without opaque hints"]
+fn fullscreen_blends_an_accepted_argb_buffer_without_opaque_regions() {
+    use std::io::Write;
+    use std::os::fd::AsFd;
+    let mut fixture = Fixture::with_config(
+        r#"
+animations:
+  window-open:
+    enabled false
+  end
+  fullscreen:
+    motion "easing"
+    duration-ms 4000
+    curve "linear"
+  end
+end
+"#,
+    );
+    let (mut queue, mut state) = native_window_named(
+        &fixture,
+        "fullscreen opaque hint",
+        "swm.fullscreen.opaque-hint",
+        [u32::MAX, 0, 0, u32::MAX],
+    );
+    fixture.node("fullscreen opaque hint");
+    queue.roundtrip(&mut state).unwrap();
+    // The outgoing single-pixel buffer is known opaque. The incoming ARGB
+    // buffer has fully painted, opaque blue pixels but advertises no opaque
+    // region. That optional optimization must not veto the accepted endpoint.
+    let mut file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(fixture.path.join("blue-argb-pixel"))
+        .unwrap();
+    file.write_all(&0xff00_00ff_u32.to_ne_bytes()).unwrap();
+    let shm: wl_shm::WlShm =
+        state
+            .registry
+            .as_ref()
+            .unwrap()
+            .bind(state.globals["wl_shm"], 1, &queue.handle(), ());
+    let pool = shm.create_pool(file.as_fd(), 4, &queue.handle(), ());
+    let blue = pool.create_buffer(0, 1, 1, 4, wl_shm::Format::Argb8888, &queue.handle(), ());
+    pool.destroy();
+    state.buffer = Some(blue);
+    state.resize_for_configures = true;
+    state.toplevel.as_ref().unwrap().set_fullscreen(None);
+    wait_for("fullscreen configure without opaque hints", || {
+        queue.roundtrip(&mut state).unwrap();
+        state.configured_fullscreen.then_some(())
+    });
+    queue.roundtrip(&mut state).unwrap();
+    let started = Instant::now();
+    thread::sleep(Duration::from_millis(1000));
+    wait_for("accepted ARGB endpoint blends during the animation", || {
+        let (pixels, _) = capture_frame_pixels(&mut fixture);
+        // Red outgoing and blue incoming should contribute together. A pure
+        // blue region outside a smaller red panel is no longer expected.
+        let mixed = pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] > 32 && p[2] > 32 && p[1] < 20)
+            .count();
+        (mixed > 1000).then_some(())
+    });
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the opaque-region hint held the outgoing snapshot until the transition ended"
+    );
+    assert!(fixture.process.try_wait().unwrap().is_none());
+}
+
+#[test]
+#[ignore = "requires a Wayland desktop and XWayland; captures pan during fullscreen exit"]
+fn panning_during_fullscreen_exit_keeps_animating_without_snapping_back() {
+    fullscreen_exit_chrome_regression(true);
+}
+
+fn fullscreen_exit_chrome_regression(pan_during_exit: bool) {
+    // Keep in sync with `duration-ms` below; slow enough to sample mid-exit.
+    let duration_ms = 4000;
+    let mut fixture = Fixture::with_config(
+        r##"
+decorations:
+  border:
+    size 4
+    colour-focused "#00ff00"
+    colour-unfocused "#00ff00"
+  end
+end
+animations:
+  window-open:
+    enabled false
+  end
+  fullscreen:
+    motion "easing"
+    duration-ms 4000
+    curve "linear"
+  end
+end
+"##,
+    );
+    let (mut queue, mut state) = native_window_named(
+        &fixture,
+        "fullscreen chrome pixels",
+        "swm.chrome.regression",
+        [u32::MAX, 0, 0, u32::MAX],
+    );
+    fixture.node("fullscreen chrome pixels");
+    state.resize_for_configures = true;
+    let manager: zxdg_decoration_manager_v1::ZxdgDecorationManagerV1 =
+        state.registry.as_ref().unwrap().bind(
+            state.globals["zxdg_decoration_manager_v1"],
+            1,
+            &queue.handle(),
+            (),
+        );
+    let decoration =
+        manager.get_toplevel_decoration(state.toplevel.as_ref().unwrap(), &queue.handle(), ());
+    decoration.set_mode(zxdg_toplevel_decoration_v1::Mode::ServerSide);
+    queue.roundtrip(&mut state).unwrap();
+    let windowed_bounds = wait_for("visible windowed border", || {
+        queue.roundtrip(&mut state).unwrap();
+        let (count, bounds) = capture_green_chrome(&mut fixture);
+        (count > 1000).then(|| bounds.unwrap())
+    });
+    state.toplevel.as_ref().unwrap().set_fullscreen(None);
+    wait_for("fullscreen configure", || {
+        queue.roundtrip(&mut state).unwrap();
+        state.configured_fullscreen.then_some(())
+    });
+    queue.roundtrip(&mut state).unwrap();
+    thread::sleep(Duration::from_millis(duration_ms + 100));
+    assert_eq!(count_green_capture_pixels(&mut fixture), 0);
+    if pan_during_exit {
+        assert!(
+            matches!(
+                fixture.request(Request::Control(swm_ipc::ControlRequest::PanField(
+                    swm_ipc::ControlDirection::Right,
+                ))),
+                Response::ApiError(_)
+            ),
+            "active fullscreen must still reject panning"
+        );
+    }
+    state.toplevel.as_ref().unwrap().unset_fullscreen();
+    wait_for("windowed configure", || {
+        queue.roundtrip(&mut state).unwrap();
+        (!state.configured_fullscreen).then_some(())
+    });
+    queue.roundtrip(&mut state).unwrap();
+    let exit_started = Instant::now();
+    thread::sleep(Duration::from_millis(150));
+    // Test the actual composed frame, not just a helper's opacity value.
+    assert_eq!(
+        count_green_capture_pixels(&mut fixture),
+        0,
+        "chrome appeared early during fullscreen return motion"
+    );
+    if pan_during_exit {
+        fixture.ack(Request::Control(swm_ipc::ControlRequest::PanField(
+            swm_ipc::ControlDirection::Right,
+        )));
+        thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            count_green_capture_pixels(&mut fixture),
+            0,
+            "panning must not finish the animation or expose early chrome"
+        );
+        let early_client = capture_colour_bounds(&mut fixture)[2].1.unwrap();
+        assert!(
+            early_client[2] - early_client[0] > windowed_bounds[2] - windowed_bounds[0],
+            "the client must still be returning from fullscreen"
+        );
+        let colours = wait_for("attached chrome fading during the return", || {
+            let colours = capture_colour_bounds(&mut fixture);
+            (colours[1].0 > 1000).then_some(colours)
+        });
+        let fading = colours[1].1.unwrap();
+        assert!(
+            fading[0] < windowed_bounds[0],
+            "pan must move the fading border before exit cleanup"
+        );
+        assert!(
+            fading[2] - fading[0] < early_client[2] - early_client[0],
+            "the return animation must keep advancing during the pan"
+        );
+        assert!(fading[2] - fading[0] > windowed_bounds[2] - windowed_bounds[0]);
+        thread::sleep(
+            Duration::from_millis(duration_ms + 500).saturating_sub(exit_started.elapsed()),
+        );
+        let settled = capture_green_chrome(&mut fixture).1.unwrap();
+        assert!(
+            settled[0] + 50 < windowed_bounds[0],
+            "cleanup must retain the pan instead of restoring the original camera"
+        );
+        assert_eq!(settled[1], windowed_bounds[1]);
+        assert!((settled[2] - settled[0]).abs_diff(windowed_bounds[2] - windowed_bounds[0]) <= 1);
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(capture_green_chrome(&mut fixture).1, Some(settled));
+        return;
+    }
+    let colours = wait_for("attached chrome fading during the return", || {
+        let colours = capture_colour_bounds(&mut fixture);
+        (colours[1].0 > 1000).then_some(colours)
+    });
+    let (count, fading_bounds) = colours[1];
+    assert!(
+        count > 1000,
+        "chrome stayed hidden until a separate late fade instead of returning with the window"
+    );
+    let fading_bounds = fading_bounds.unwrap();
+    assert!(fading_bounds[2] - fading_bounds[0] > windowed_bounds[2] - windowed_bounds[0]);
+    thread::sleep(Duration::from_millis(100));
+    let later_bounds = capture_green_chrome(&mut fixture).1.unwrap();
+    assert!(later_bounds[2] - later_bounds[0] < fading_bounds[2] - fading_bounds[0]);
+    thread::sleep(Duration::from_millis(duration_ms + 500).saturating_sub(exit_started.elapsed()));
+    wait_for("fully restored border after animation cleanup", || {
+        (count_green_capture_pixels(&mut fixture) > 1000).then_some(())
+    });
+    assert_eq!(capture_green_chrome(&mut fixture).1, Some(windowed_bounds));
+}
+
+#[test]
+#[ignore = "requires a Wayland desktop and XWayland; starts an isolated nested compositor"]
+fn portal_monitor_capture_redacts_protected_window() {
+    let mut fixture = Fixture::new();
+    let (mut queue, mut state) = native_window_named(
+        &fixture,
+        "privacy test",
+        "swm.privacy.secret",
+        [u32::MAX, 0, 0, u32::MAX],
+    );
+    fixture.node("privacy test");
+    queue.roundtrip(&mut state).unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let red_count = |pixels: &[u8]| {
+        pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[2] > 245 && p[1] < 5 && p[0] < 5)
+            .count()
+    };
+    wait_for("unprotected red window in portal capture", || {
+        let (pixels, _) = capture_frame_pixels(&mut fixture);
+        (red_count(&pixels) > 1000).then_some(())
+    });
+    let window_id = fixture.node("privacy test").id;
+    let mut cast = swm_ipc::Connection::connect_to(&fixture.path.join("swm/swm.sock")).unwrap();
+    assert!(matches!(
+        cast.request(&Request::BeginWindowCast { window_id }, &[])
+            .unwrap()
+            .response,
+        Response::Ack
+    ));
+    drop(cast);
+    fs::write(fixture.path.join("swm.rune"), "keybinds:\nend\nrules:\n  window-rule:\n    app-id \"swm.privacy.secret\"\n    block-screencast true\n  end\nend\n").unwrap();
+    fixture.ack(Request::ConfigReload);
+    wait_for("privacy rule applied", || {
+        let (pixels, _) = capture_frame_pixels(&mut fixture);
+        (red_count(&pixels) == 0).then_some(())
+    });
+    assert!(
+        matches!(
+            fixture.request(Request::BeginWindowCast { window_id }),
+            Response::ApiError(error) if error.kind == swm_ipc::ServerErrorKind::InvalidRequest
+        ),
+        "protected direct window cast must be rejected"
+    );
+}
+
+#[test]
+#[ignore = "requires a Wayland desktop and XWayland; starts an isolated nested compositor"]
+fn shared_window_indicator_follows_connection_lifetimes() {
+    let mut fixture = Fixture::new();
+    let (mut queue, mut state) = native_window(&fixture);
+    fixture.node("surviving native window");
+    queue.roundtrip(&mut state).unwrap();
+    let indicator_count = |fixture: &mut Fixture| {
+        let (pixels, _) = capture_frame_pixels(fixture);
+        pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| {
+                (p[2] as i32 - 240).abs() <= 2
+                    && (p[1] as i32 - 51).abs() <= 2
+                    && (p[0] as i32 - 61).abs() <= 2
+            })
+            .count()
+    };
+    assert_eq!(indicator_count(&mut fixture), 0);
+    let window_id = fixture.node("surviving native window").id;
+    let path = fixture.path.join("swm/swm.sock");
+    let mut first = swm_ipc::Connection::connect_to(&path).unwrap();
+    let mut second = swm_ipc::Connection::connect_to(&path).unwrap();
+    for connection in [&mut first, &mut second] {
+        assert!(matches!(
+            connection
+                .request(&Request::BeginWindowCast { window_id }, &[])
+                .unwrap()
+                .response,
+            Response::Ack
+        ));
+    }
+    wait_for("indicator appears", || {
+        (indicator_count(&mut fixture) > 100).then_some(())
+    });
+    drop(first);
+    assert!(
+        indicator_count(&mut fixture) > 100,
+        "second share must retain indicator"
+    );
+    drop(second);
+    wait_for("indicator disappears after last stream", || {
+        (indicator_count(&mut fixture) == 0).then_some(())
+    });
+}
+
+#[test]
+#[ignore = "requires a Wayland desktop and XWayland; starts an isolated nested compositor"]
+fn portal_monitor_capture_redacts_layer_surface() {
+    let mut fixture = Fixture::new();
+    let (mut queue, mut state) = native_connection(&fixture);
+    let handle = queue.handle();
+    let registry = state.registry.as_ref().unwrap().clone();
+    let compositor: wl_compositor::WlCompositor =
+        registry.bind(state.globals["wl_compositor"], 6, &handle, ());
+    let pixels: pixel::WpSinglePixelBufferManagerV1 = registry.bind(
+        state.globals["wp_single_pixel_buffer_manager_v1"],
+        1,
+        &handle,
+        (),
+    );
+    let viewporter: wp_viewporter::WpViewporter =
+        registry.bind(state.globals["wp_viewporter"], 1, &handle, ());
+    let shell: layer_shell::ZwlrLayerShellV1 =
+        registry.bind(state.globals["zwlr_layer_shell_v1"], 4, &handle, ());
+    let surface = compositor.create_surface(&handle, ());
+    let viewport = viewporter.get_viewport(&surface, &handle, ());
+    viewport.set_destination(180, 120);
+    let layer = shell.get_layer_surface(
+        &surface,
+        None,
+        layer_shell::Layer::Overlay,
+        "swm-privacy-test".into(),
+        &handle,
+        (),
+    );
+    layer.set_size(180, 120);
+    layer.set_anchor(layer_surface::Anchor::Top | layer_surface::Anchor::Left);
+    state.buffer = Some(pixels.create_u32_rgba_buffer(u32::MAX, 0, 0, u32::MAX, &handle, ()));
+    state.surface = Some(surface.clone());
+    surface.commit();
+    queue.roundtrip(&mut state).unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let red_count = |pixels: &[u8]| {
+        pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[2] > 245 && p[1] < 5 && p[0] < 5)
+            .count()
+    };
+    wait_for("unprotected layer in portal capture", || {
+        queue.roundtrip(&mut state).unwrap();
+        let (pixels, _) = capture_frame_pixels(&mut fixture);
+        (red_count(&pixels) > 1000).then_some(())
+    });
+    fs::write(fixture.path.join("swm.rune"), "keybinds:\nend\nrules:\n  layer-rule:\n    namespace \"swm-privacy-test\"\n    block-screencast true\n  end\nend\n").unwrap();
+    fixture.ack(Request::ConfigReload);
+    wait_for("protected layer removed from portal capture", || {
+        let (pixels, _) = capture_frame_pixels(&mut fixture);
+        (red_count(&pixels) == 0).then_some(())
+    });
+}
+
+#[test]
+#[ignore = "requires a Wayland desktop and XWayland; starts an isolated nested compositor"]
+fn active_window_stream_turns_black_when_rule_is_enabled() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileExt;
+    let decorations = "decorations:\n  border:\n    size 0\n  end\nend\n";
+    let mut fixture = Fixture::with_config(decorations);
+    let (mut queue, mut state) = native_window_named(
+        &fixture,
+        "privacy window",
+        "swm.privacy.secret",
+        [u32::MAX, 0, 0, u32::MAX],
+    );
+    fixture.node("privacy window");
+    queue.roundtrip(&mut state).unwrap();
+    let window_id = fixture.node("privacy window").id;
+    let size = 240 * 160 * 4;
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(fixture.path.join("window-cast-frame"))
+        .unwrap();
+    file.set_len(size).unwrap();
+    let request = Request::CaptureFrame(swm_ipc::CaptureFrameRequest {
+        stream_handle: "active-window-privacy".into(),
+        source: swm_ipc::CaptureSource::Window {
+            window_id,
+            width: 240,
+            height: 160,
+        },
+        cursor_mode: swm_ipc::CursorMode::Hidden,
+        buffer: swm_ipc::CaptureBuffer::MemFd {
+            fd_index: 0,
+            offset: 0,
+            size,
+            stride: 240 * 4,
+        },
+    });
+    let mut cast = swm_ipc::Connection::connect_to(&fixture.path.join("swm/swm.sock")).unwrap();
+    assert!(matches!(
+        cast.request(&Request::BeginWindowCast { window_id }, &[])
+            .unwrap()
+            .response,
+        Response::Ack
+    ));
+    let frame = |cast: &mut swm_ipc::Connection| {
+        let response = cast
+            .request(&request, &[file.as_raw_fd()])
+            .unwrap()
+            .response;
+        assert!(
+            matches!(response, Response::Frame(_)),
+            "window frame failed: {response:?}"
+        );
+        let mut pixels = vec![0; size as usize];
+        file.read_exact_at(&mut pixels, 0).unwrap();
+        pixels
+    };
+    wait_for("unprotected window frame", || {
+        (frame(&mut cast)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[2] > 245 && p[1] < 5 && p[0] < 5)
+            .count()
+            > 1000)
+            .then_some(())
+    });
+    fs::write(fixture.path.join("swm.rune"), format!("keybinds:\nend\n{decorations}rules:\n  window-rule:\n    app-id \"swm.privacy.secret\"\n    block-screencast true\n  end\nend\n")).unwrap();
+    fixture.ack(Request::ConfigReload);
+    wait_for("protected window frame becomes black", || {
+        frame(&mut cast)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|p| p[0] == 0 && p[1] == 0 && p[2] == 0)
+            .then_some(())
+    });
+}

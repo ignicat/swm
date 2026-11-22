@@ -1,0 +1,63 @@
+# swm configuration (`$XDG_CONFIG_HOME/swm/swm.rune`, fallback `~/.config/swm/swm.rune`)
+#
+# Valid saves reload live; invalid edits keep the last active config. swm never rewrites this file.
+# Verify changes: `swmctl config verify` | Edit: `swmctl config edit`
+#
+# Everything outside `keybinds:` is optional and uses built-in defaults unless set here:
+#   autostart, env, view, wallpaper, input, cursor, font, decorations,
+#   overlays, field, node, trail, decay, physics, animations, rules, debug
+# See `examples/swm.reference.rune` in the swm repository for every option and default.
+
+keybinds:
+  # `$var.mod` resolves to "super" on TTY, or "alt" under nested `--winit`.
+  mod "super"
+
+  # Session & config
+  "$var.mod+shift+e" "quit"
+  "$var.mod+shift+r" "reload"
+
+  # Window & node control
+  "$var.mod+q" "close-focused"
+  "$var.mod+f" "toggle-fullscreen"
+  "$var.mod+m" "maximize-focused"
+  "$var.mod+n" "toggle-state"
+  "$var.mod+p" "toggle-focused-pin"
+
+  # Apps & companion tools
+  "$var.mod+t" "default-terminal"
+  "$var.mod+d" "swm-lift"
+  "Print" "swm-screenshoter"
+
+  # Navigation, Trail & zoom
+  "$var.mod+o" "zoom-fit"
+  "alt+tab" "cycle-focus"
+  "alt+shift+tab" "cycle-focus-backward"
+  "$var.mod+h" "center-last-focused"
+  "$var.mod+comma" "trail-prev"
+  "$var.mod+period" "trail-next"
+  "$var.mod+minus" "zoom-out"
+  "$var.mod+equal" "zoom-in"
+  "$var.mod+shift+0" "zoom-reset"
+
+  # Focus & monitors
+  "$var.mod+left" "focus-left"
+  "$var.mod+right" "focus-right"
+  "$var.mod+up" "focus-up"
+  "$var.mod+down" "focus-down"
+  "$var.mod+shift+left" "monitor-focus left"
+  "$var.mod+shift+right" "monitor-focus right"
+  "$var.mod+shift+up" "monitor-focus up"
+  "$var.mod+shift+down" "monitor-focus down"
+
+  # Keyboard resize
+  "$var.mod+ctrl+left" "resize-window-left" with scope "field"
+  "$var.mod+ctrl+right" "resize-window-right" with scope "field"
+  "$var.mod+ctrl+up" "resize-window-up" with scope "field"
+  "$var.mod+ctrl+down" "resize-window-down" with scope "field"
+
+  # Pointer actions (empty-Field pan + window drag/resize)
+  "$var.mod+click-left" "move-window"
+  "$var.mod+click-right" "resize-window"
+  "$var.mod+shift+click-left" "drag-pan"
+  "click-left" "pan-field"
+end

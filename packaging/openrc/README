@@ -1,0 +1,15 @@
+swm on OpenRC
+=============
+
+swm runs as a user session, so no OpenRC system service is installed.
+Enable seatd or elogind at the system level, then launch `/usr/bin/swm-session`
+from your display manager or login shell (a D-Bus user session with
+`dbus-update-activation-environment` is needed for portal activation).
+
+`swm-session` checks for an active systemd user manager first and a configured
+dinit user manager second; without either, it execs `swm --session` directly.
+swm then publishes `WAYLAND_DISPLAY` and `XDG_CURRENT_DESKTOP=SWM` via
+`dbus-update-activation-environment`.
+
+Set `SWM_NO_INIT_INTEGRATION=1` to force the direct path even if a user service
+manager is present.

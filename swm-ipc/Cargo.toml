@@ -1,0 +1,15 @@
+[package]
+name = "swm-ipc"
+version = "0.1.0"
+edition = "2024"
+description = "Inter-process communication protocol for swm (simple window manager)"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+libc = "0.2"
+postcard = { version = "1", features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }

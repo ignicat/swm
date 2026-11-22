@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.freedesktop.impl.portal.desktop.swm
+Exec=/usr/bin/xdg-desktop-portal-swm
+SystemdService=xdg-desktop-portal-swm.service

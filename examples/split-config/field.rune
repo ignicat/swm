@@ -1,0 +1,40 @@
+# Field navigation and spatial-window behavior.
+
+field:
+  gap 20.0
+
+  pins:
+    corner "top-right"
+    colour "#d65d26"
+    background-colour "#1d2021"
+    size 1.0
+  end
+
+  close-restore-focus true
+  close-restore-nodes false
+  close-restore-pan "if-offscreen"
+
+  zoom:
+    enabled true
+    step 1.10
+    min 0.35
+    smooth-rate 12.5
+  end
+end
+
+# Contact motion for nodes and node/window displacement.
+physics:
+  enabled true
+  damping 0.45
+end
+
+decay:
+  # Off by default. When enabled, only windows entirely off screen collapse.
+  enabled false
+  delay-seconds 600
+end
+
+trail:
+  history-length 32
+  wrap true
+end

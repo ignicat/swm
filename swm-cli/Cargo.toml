@@ -1,0 +1,21 @@
+[package]
+name = "swm-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Command-line interface for controlling swm (simple window manager)"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "swmctl"
+path = "src/main.rs"
+
+[dependencies]
+swm-api = { version = "0.1.0", path = "../swm-api" }
+swm-config = { version = "0.1.0", path = "../swm-config" }
+serde = "1"
+serde_json = "1"
+shlex = "1.3"

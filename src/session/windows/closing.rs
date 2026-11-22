@@ -1,0 +1,561 @@
+use smithay::backend::renderer::Renderer;
+use smithay::desktop::Window;
+use smithay::output::Output;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::wayland::seat::WaylandFocus;
+
+use super::{Session, SessionDriver};
+
+pub(crate) fn capture_surface<D: SessionDriver>(
+    session: &mut Session<D>,
+    surface: &WlSurface,
+) -> bool {
+    if session.render.window_close_animations.has_pending(surface) {
+        return true;
+    }
+    let Some(window) = session
+        .wayland
+        .space
+        .elements()
+        .find(|window| {
+            window
+                .wl_surface()
+                .is_some_and(|candidate| candidate.as_ref() == surface)
+        })
+        .cloned()
+    else {
+        return false;
+    };
+    capture_window(session, &window)
+}
+
+/// Captures a native toplevel immediately before its buffer-removal commit.
+///
+/// A close request is advisory: clients such as Firefox may keep the toplevel
+/// mapped while they ask the user for confirmation.  Waiting for this
+/// authoritative unmap boundary keeps the live client visible and interactive
+/// if it rejects the request, while still preserving the last attached frame
+/// for the close animation.
+pub(crate) fn capture_native_toplevel_before_unmap<D: SessionDriver>(
+    session: &mut Session<D>,
+    surface: &WlSurface,
+) -> bool {
+    let Some(window) = session
+        .wayland
+        .space
+        .elements()
+        .find(|window| {
+            window
+                .toplevel()
+                .is_some_and(|toplevel| toplevel.wl_surface() == surface)
+        })
+        .cloned()
+    else {
+        return false;
+    };
+    capture_window(session, &window)
+}
+
+pub(crate) fn capture_window<D: SessionDriver>(session: &mut Session<D>, window: &Window) -> bool {
+    capture_window_inner(session, window, false, CaptureKind::Decorated)
+}
+
+/// Automatic decay runs on the event loop; reuse an existing preview snapshot
+/// when available and otherwise fall back to single-pass client capture.
+pub(crate) fn capture_window_for_node<D: SessionDriver>(
+    session: &mut Session<D>,
+    window: &Window,
+    decay: bool,
+) -> bool {
+    let kind = if decay {
+        CaptureKind::Decay
+    } else {
+        CaptureKind::Node
+    };
+    capture_window_inner(session, window, false, kind)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureKind {
+    Decorated,
+    Node,
+    Decay,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CapturePath {
+    Cached,
+    Client,
+    Decorated,
+}
+
+fn capture_path(kind: CaptureKind, has_clean_cache: bool) -> CapturePath {
+    match (kind, has_clean_cache) {
+        (CaptureKind::Decay, true) => CapturePath::Cached,
+        (CaptureKind::Decay, false) => CapturePath::Client,
+        _ => CapturePath::Decorated,
+    }
+}
+
+fn captures_before_client_decision(is_x11: bool) -> bool {
+    is_x11
+}
+
+pub(crate) fn capture_before_close_request<D: SessionDriver>(
+    session: &mut Session<D>,
+    window: &Window,
+) -> bool {
+    captures_before_client_decision(crate::xwayland::is_x11(window))
+        && capture_window(session, window)
+}
+
+/// Give secondary Steam windows the same immediate visual response as their
+/// client-owned close button, without retiring their actual client lifetime.
+pub(crate) fn start_shortcut_close<D: SessionDriver>(
+    session: &mut Session<D>,
+    window: &Window,
+    captured: bool,
+) {
+    if !crate::xwayland::is_steam_auxiliary_window(window) {
+        return;
+    }
+    let Some(surface) = window.wl_surface().map(|surface| surface.into_owned()) else {
+        return;
+    };
+    let eligible = session
+        .nodes
+        .id_for_surface(&surface)
+        .and_then(|id| session.nodes.record(id))
+        .is_some_and(|record| record.attached && !record.collapsed);
+    if !eligible
+        || session.pointer_handle().is_grabbed()
+        || session.fullscreen.is_fullscreen_or_pending(&surface)
+        || crate::xwayland::is_fullscreen(window)
+    {
+        return;
+    }
+    let animations = &session.settings.animations;
+    let animated = animations.enabled
+        && animations.window_close.enabled
+        && animations.window_close.duration_ms > 0;
+    // Capture failure keeps the ordinary close path. Disabled animations still
+    // receive immediate, reversible visual dismissal.
+    if animated && !captured {
+        return;
+    }
+    let Some(generation) = crate::window::closing::begin(window) else {
+        return;
+    };
+    if !session
+        .xwayland
+        .arm_shortcut_close_timeout(window.clone(), generation)
+    {
+        crate::window::closing::finish(window);
+        return;
+    }
+    if captured {
+        session
+            .render
+            .window_close_animations
+            .start_speculative(&surface, crate::frame_clock::monotonic_now());
+    }
+    super::lifecycle::handoff_visual_close_focus(session, &surface);
+    session.request_redraw();
+}
+
+#[cfg(feature = "xwayland")]
+pub(crate) fn recover_shortcut_close<D: SessionDriver>(
+    session: &mut Session<D>,
+    window: &Window,
+    generation: u64,
+) {
+    if !crate::window::closing::expire(window, generation) {
+        return;
+    }
+    if let Some(surface) = window.wl_surface() {
+        session
+            .render
+            .window_close_animations
+            .cancel(surface.as_ref());
+    }
+    session.xwayland.cancel_close_request(window);
+    // Reveal without stealing the user's new keyboard focus.
+    super::pointer::refresh_desktop_client_focus(
+        session,
+        session.start_time.elapsed().as_millis() as u32,
+    );
+    session.request_redraw();
+}
+
+/// Starts the visual close immediately for Steam's client-owned X11 control.
+/// CEF otherwise submits an opaque black teardown buffer for long enough to
+/// be presented before `UnmapNotify`. The active snapshot replaces that live
+/// surface, then remains transparent after the animation until teardown is
+/// confirmed or the bounded safety timeout restores the client.
+pub(crate) fn start_steam_client_close_control<D: SessionDriver>(
+    session: &mut Session<D>,
+    window: &Window,
+) -> bool {
+    let Some(surface) = window.wl_surface().map(|surface| surface.into_owned()) else {
+        return false;
+    };
+    // This runs before the release is forwarded to Steam, while its good
+    // client buffer is still attached. The capture copies those pixels into
+    // a compositor-owned texture and drops every client buffer guard before
+    // Steam can begin teardown.
+    if !capture_window_inner(session, window, false, CaptureKind::Decorated) {
+        return false;
+    }
+    if !session
+        .render
+        .window_close_animations
+        .start_speculative(&surface, crate::frame_clock::monotonic_now())
+    {
+        return false;
+    }
+    session.xwayland.arm_speculative_close_timeout(surface);
+    session.request_redraw();
+    true
+}
+
+fn capture_window_inner<D: SessionDriver>(
+    session: &mut Session<D>,
+    window: &Window,
+    provisional: bool,
+    kind: CaptureKind,
+) -> bool {
+    if crate::xwayland::is_override_redirect(window) {
+        return false;
+    }
+    let Some(surface) = window.wl_surface().map(|surface| surface.into_owned()) else {
+        return false;
+    };
+    if crate::wayland::clipboard_helper::saved_focus(&surface).is_some() {
+        return false;
+    }
+    if session.render.window_close_animations.has_pending(&surface) {
+        return true;
+    }
+    let Some(output) = output_for_window(&session.wayland, session.driver.primary_output(), window)
+    else {
+        return false;
+    };
+    let now = crate::frame_clock::monotonic_now();
+    let Some(visual) = crate::presentation::window::window_visual_state(
+        crate::presentation::window::WindowVisualContext {
+            space: &session.wayland.space,
+            cameras: &session.cameras,
+            output: &output,
+            window_animations: &session.window_animations,
+            fullscreen: &session.fullscreen,
+            maximize: &session.maximize,
+            decorations: &session.settings.decorations,
+            now,
+        },
+        window,
+    ) else {
+        return false;
+    };
+    let Some(stack_index) = session
+        .wayland
+        .space
+        .elements()
+        .position(|candidate| candidate == window)
+    else {
+        return false;
+    };
+    let focused = session.wayland.focused_window.as_ref() == Some(&surface);
+    let chrome_visible = !session.fullscreen.suppresses_window_chrome(window);
+    let maximized = session.maximize.contains(&surface);
+    let initial_destination = closing_destination(
+        window,
+        visual,
+        chrome_visible,
+        &session.settings.decorations,
+    );
+    let anchor = if visual.presentation_space
+        == crate::presentation::window::PresentationSpace::OutputLocal
+    {
+        crate::render::close::CloseAnchor::OutputLocal
+    } else {
+        crate::render::close::CloseAnchor::Windowed {
+            world_geometry: visual.source_geometry,
+            captured_camera_rect: visual.camera_rect,
+        }
+    };
+    let retract_origin = session
+        .opening_origins
+        .active(&surface)
+        .or_else(|| super::opening::fallback_origin(session, &output))
+        .and_then(|origin| {
+            let output_geometry = session.wayland.space.output_geometry(&output)?;
+            Some(
+                smithay::utils::Point::<f64, smithay::utils::Physical>::from((
+                    origin.x - f64::from(output_geometry.loc.x),
+                    origin.y - f64::from(output_geometry.loc.y),
+                )),
+            )
+        });
+    let decorated_metadata = crate::render::close::CloseSnapshotMetadata {
+        output_name: output.name(),
+        initial_destination,
+        anchor,
+        stack_index,
+        start_alpha: visual.opening_alpha * session.window_rules.opacity(&surface),
+        retract_origin,
+        // The snapshot includes the complete compositor decoration, so the
+        // closing scene must not synthesize a second border pass.
+        border: None,
+        collapse_target: None,
+    };
+    let border_width = crate::window_chrome::scaled_metric(
+        session.settings.decorations.border_width_px,
+        visual.zoom_scale,
+    );
+    let client_metadata = crate::render::close::CloseSnapshotMetadata {
+        output_name: output.name(),
+        initial_destination: visual.animated_rect,
+        anchor,
+        stack_index,
+        start_alpha: visual.opening_alpha * session.window_rules.opacity(&surface),
+        retract_origin,
+        border: (chrome_visible
+            && session.window_rules.applied(&surface).border != Some(false)
+            && border_width > 0)
+            .then(|| crate::render::close::CloseBorder {
+                width: border_width,
+                color: crate::render::window_border_color(&session.settings.decorations, focused),
+            }),
+        collapse_target: None,
+    };
+    let draw_border = session.window_rules.applied(&surface).border != Some(false);
+    let decorations = session.settings.decorations;
+    let preview_id = session.nodes.id_for_surface(&surface);
+    let render = &mut session.render;
+    let window_close_animations = &mut render.window_close_animations;
+    let overlay_previews = &mut render.overlay_previews;
+    let capture = session.driver.with_renderer(|renderer| {
+        let cached = (kind == CaptureKind::Decay)
+            .then(|| {
+                preview_id
+                    .and_then(|id| overlay_previews.clean_texture(id, maximized))
+                    .filter(|texture| texture.context == renderer.context_id())
+            })
+            .flatten();
+        match capture_path(kind, cached.is_some()) {
+            CapturePath::Cached => window_close_animations.capture(
+                window,
+                cached.expect("cached capture path requires a texture"),
+                decorated_metadata,
+                kind != CaptureKind::Decorated,
+            ),
+            CapturePath::Client => {
+                let texture = crate::render::window_texture::capture(renderer, window, None)?;
+                if let Some(id) = preview_id {
+                    // A current client snapshot remains a useful fallback for
+                    // the now-unmapped node. Overlay chrome supplies its frame.
+                    overlay_previews.store_last_good(id, texture.clone(), maximized);
+                }
+                window_close_animations.capture(
+                    window,
+                    texture,
+                    client_metadata,
+                    kind != CaptureKind::Decorated,
+                )
+            }
+            CapturePath::Decorated => {
+                let texture = crate::render::window_texture::capture_decorated(
+                    renderer,
+                    window,
+                    None,
+                    crate::render::window_texture::CaptureChrome {
+                        decorations: &decorations,
+                        focused,
+                        visible: chrome_visible,
+                        draw_border,
+                    },
+                )?;
+                if let Some(id) = preview_id {
+                    overlay_previews.store_last_good(id, texture.clone(), maximized);
+                }
+                window_close_animations.capture(
+                    window,
+                    texture,
+                    decorated_metadata,
+                    kind != CaptureKind::Decorated,
+                )
+            }
+        }
+    });
+    match capture {
+        Ok(captured) => {
+            if captured && provisional {
+                session
+                    .render
+                    .window_close_animations
+                    .mark_provisional(surface);
+            }
+            captured
+        }
+        Err(err) => {
+            eventline::warn!("window close: failed to capture window texture: {err}");
+            false
+        }
+    }
+}
+
+fn closing_destination(
+    window: &Window,
+    visual: crate::presentation::window::WindowVisualState,
+    chrome_visible: bool,
+    decorations: &swm_config::Decorations,
+) -> smithay::utils::Rectangle<i32, smithay::utils::Physical> {
+    if !chrome_visible {
+        return visual.animated_rect;
+    }
+    let opening_scale_y = if visual.presentation_rect.size.h > 0 {
+        visual.animated_rect.size.h as f32 / visual.presentation_rect.size.h as f32
+    } else {
+        1.0
+    };
+    let decoration_scale = visual.zoom_scale * opening_scale_y.max(0.0);
+    let chrome = crate::window_chrome::WindowChrome::for_window(window, decorations);
+    let border_width = crate::window_chrome::scaled_metric(chrome.border_width, decoration_scale);
+    smithay::utils::Rectangle::new(
+        (
+            visual.animated_rect.loc.x - border_width,
+            visual.animated_rect.loc.y - border_width,
+        )
+            .into(),
+        (
+            visual.animated_rect.size.w + border_width * 2,
+            visual.animated_rect.size.h + border_width * 2,
+        )
+            .into(),
+    )
+}
+
+pub(crate) fn start<D: SessionDriver>(session: &mut Session<D>, surface: &WlSurface) -> bool {
+    session
+        .render
+        .window_close_animations
+        .start(surface, crate::frame_clock::monotonic_now())
+}
+
+/// Captures and activates the close texture while the window is still mapped.
+///
+/// X11 clients without an intercepted close control expose their first
+/// authoritative close boundary at `UnmapNotify`. Capture the currently
+/// attached buffer as a best effort before the live window leaves `Space`.
+/// Known client-owned controls such as Steam are captured earlier, before the
+/// click is forwarded, so they never reach this fallback with teardown pixels.
+#[cfg(feature = "xwayland")]
+pub(crate) fn capture_and_activate_before_unmap<D: SessionDriver>(
+    session: &mut Session<D>,
+    window: &Window,
+) -> bool {
+    let Some(surface) = window.wl_surface().map(|surface| surface.into_owned()) else {
+        return false;
+    };
+    if session.render.window_close_animations.is_active(&surface) {
+        session
+            .render
+            .window_close_animations
+            .confirm_unmapped(&surface);
+        return true;
+    }
+    let captured = capture_window_inner(session, window, false, CaptureKind::Decorated);
+    if !captured {
+        return false;
+    }
+    let activated = start(session, &surface);
+    debug_assert!(
+        !activated || session.render.window_close_animations.is_active(&surface),
+        "a successful close handoff must be active before the live window is unmapped"
+    );
+    if activated {
+        session.request_redraw();
+    }
+    activated
+}
+
+/// Handles XWayland's null-buffer commit before Smithay applies it. This is
+/// an authoritative visual teardown boundary even if the XWM callback is
+/// delayed: an already-started speculative close may now expire normally,
+/// and a compositor-requested pending snapshot may begin without exposing an
+/// empty live surface.
+pub(crate) fn x11_buffer_removed<D: SessionDriver>(
+    session: &mut Session<D>,
+    surface: &WlSurface,
+) -> bool {
+    let is_mapped_x11 = session.wayland.space.elements().any(|window| {
+        crate::xwayland::is_x11(window)
+            && window
+                .wl_surface()
+                .is_some_and(|candidate| candidate.as_ref() == surface)
+    });
+    if !is_mapped_x11 {
+        return false;
+    }
+
+    let animations = &mut session.render.window_close_animations;
+    let changed = if animations.is_active(surface) {
+        animations.confirm_unmapped(surface)
+    } else if animations.has_pending(surface) {
+        animations.start(surface, crate::frame_clock::monotonic_now())
+    } else {
+        false
+    };
+    if changed {
+        session.request_redraw();
+    }
+    true
+}
+
+pub(crate) fn mapped<D: SessionDriver>(session: &mut Session<D>, surface: &WlSurface) {
+    for record in session
+        .nodes
+        .records()
+        .filter(|record| &record.surface == surface)
+    {
+        crate::window::closing::finish(&record.window);
+    }
+    session.render.window_close_animations.cancel(surface);
+}
+
+fn output_for_window(
+    wayland: &crate::wayland::WaylandState,
+    primary: &Output,
+    window: &Window,
+) -> Option<Output> {
+    wayland
+        .space
+        .outputs()
+        .find(|output| crate::wayland::window_is_on_output(window, output, primary))
+        .cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CaptureKind, CapturePath, capture_path, captures_before_client_decision};
+
+    #[test]
+    fn only_x11_captures_before_an_advisory_close_can_be_rejected() {
+        assert!(captures_before_client_decision(true));
+        assert!(!captures_before_client_decision(false));
+    }
+
+    #[test]
+    fn decay_reuses_a_current_gpu_preview_before_capturing_again() {
+        assert_eq!(capture_path(CaptureKind::Decay, true), CapturePath::Cached);
+    }
+
+    #[test]
+    fn uncached_decay_uses_the_single_pass_client_capture() {
+        assert_eq!(capture_path(CaptureKind::Decay, false), CapturePath::Client);
+        assert_eq!(
+            capture_path(CaptureKind::Decorated, true),
+            CapturePath::Decorated
+        );
+    }
+}

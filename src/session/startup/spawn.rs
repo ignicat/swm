@@ -1,0 +1,273 @@
+// Detached process launching for session actions.
+
+use std::ffi::OsStr;
+use std::io;
+use std::os::unix::process::CommandExt;
+use std::process::{Command, Stdio};
+
+use super::autostart::AutostartChild;
+use super::environment::LaunchEnvironment;
+
+/// Spawns a user-provided command line detached from the compositor, with
+/// `WAYLAND_DISPLAY` set to SWM's socket rather than the ambient host.
+///
+/// The shell is intentional: loose keybinds may contain arguments, quoting,
+/// pipelines, or substitutions. The config is user-authored and has the
+/// same authority as starting a command from their own shell.
+pub(super) fn spawn_detached(
+    command_line: &str,
+    wayland_display: &OsStr,
+    x11_display: Option<&OsStr>,
+    cursor_size: u8,
+    environment: &LaunchEnvironment,
+) {
+    spawn_detached_with_env(
+        command_line,
+        wayland_display,
+        x11_display,
+        cursor_size,
+        environment,
+        &[],
+    );
+}
+
+pub(super) fn spawn_detached_with_env(
+    command_line: &str,
+    wayland_display: &OsStr,
+    x11_display: Option<&OsStr>,
+    cursor_size: u8,
+    environment: &LaunchEnvironment,
+    extra_environment: &[(&str, &str)],
+) {
+    let mut process = detached_process_with_env(
+        command_line,
+        wayland_display,
+        x11_display,
+        cursor_size,
+        environment,
+        extra_environment,
+    );
+
+    launch(&mut process, command_line, wayland_display, x11_display);
+}
+
+/// Autostart output belongs in persistent files, rather than the terminal or
+/// /dev/null. Ordinary keybind launches keep their existing behavior.
+pub(super) fn spawn_autostart(
+    command_line: &str,
+    wayland_display: &OsStr,
+    x11_display: Option<&OsStr>,
+    cursor_size: u8,
+    environment: &LaunchEnvironment,
+) -> Option<AutostartChild> {
+    let path = match crate::autostart_log::prepare(command_line) {
+        Ok(path) => path,
+        Err(err) => {
+            eventline::warn!("autostart: output logging unavailable for {command_line:?}: {err}");
+            let mut process = Command::new("sh");
+            process
+                .arg("-c")
+                .arg(command_line)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            configure_environment(
+                &mut process,
+                wayland_display,
+                x11_display,
+                cursor_size,
+                environment,
+                &[],
+            );
+            session_process_group(&mut process);
+            return process
+                .spawn()
+                .map(|child| AutostartChild::new(command_line, child, None))
+                .map_err(|error| {
+                    eventline::error!("autostart: failed to launch {command_line:?}: {error}");
+                })
+                .ok();
+        }
+    };
+    // Execute this running binary even if an upgrade replaced its installed
+    // pathname. current_exe() can return an unusable "(deleted)" path then.
+    let mut process = session_autostart_process(
+        std::path::Path::new("/proc/self/exe"),
+        &path,
+        command_line,
+        wayland_display,
+        x11_display,
+        cursor_size,
+        environment,
+    );
+    eventline::info!("autostart: {command_line:?} output log: {}", path.display());
+    match process.spawn() {
+        Ok(child) => Some(AutostartChild::new(command_line, child, Some(path))),
+        Err(err) => {
+            eventline::error!("autostart: failed to launch {command_line:?}: {err}");
+            None
+        }
+    }
+}
+
+pub(super) fn session_autostart_process(
+    program: &std::path::Path,
+    path: &std::path::Path,
+    command_line: &str,
+    wayland_display: &OsStr,
+    x11_display: Option<&OsStr>,
+    cursor_size: u8,
+    environment: &LaunchEnvironment,
+) -> Command {
+    let mut process = logged_process(
+        program,
+        path,
+        command_line,
+        wayland_display,
+        x11_display,
+        cursor_size,
+        environment,
+    );
+    session_process_group(&mut process);
+    process
+}
+
+fn session_process_group(process: &mut Command) {
+    // Keep the logger as our child and process-group leader so clean logout
+    // can terminate only this session's startup command and its descendants.
+    unsafe {
+        process.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
+
+fn logged_process(
+    program: &std::path::Path,
+    path: &std::path::Path,
+    command_line: &str,
+    wayland_display: &OsStr,
+    x11_display: Option<&OsStr>,
+    cursor_size: u8,
+    environment: &LaunchEnvironment,
+) -> Command {
+    let mut process = Command::new(program);
+    process
+        .arg(crate::autostart_log::WORKER_ARG)
+        .arg(path)
+        .arg(command_line);
+    configure_environment(
+        &mut process,
+        wayland_display,
+        x11_display,
+        cursor_size,
+        environment,
+        &[],
+    );
+    process
+}
+
+fn launch(
+    process: &mut Command,
+    command_line: &str,
+    wayland_display: &OsStr,
+    x11_display: Option<&OsStr>,
+) {
+    match process.spawn() {
+        Ok(mut child) => {
+            // The immediate child exits after its own fork. The command's
+            // shell is already reparented and will be reaped independently.
+            match child.wait() {
+                Ok(_) => eventline::debug!(
+                    "spawn: launched {command_line:?} (WAYLAND_DISPLAY={wayland_display:?}, DISPLAY={x11_display:?})"
+                ),
+                Err(err) => {
+                    eventline::warn!("spawn: failed to reap intermediate process: {err}")
+                }
+            }
+        }
+        Err(err) => eventline::error!("spawn: failed to launch {command_line:?}: {err}"),
+    }
+}
+
+fn detached_process_with_env(
+    command_line: &str,
+    wayland_display: &OsStr,
+    x11_display: Option<&OsStr>,
+    cursor_size: u8,
+    environment: &LaunchEnvironment,
+    extra_environment: &[(&str, &str)],
+) -> Command {
+    let mut process = configured_process(
+        command_line,
+        wayland_display,
+        x11_display,
+        cursor_size,
+        environment,
+        extra_environment,
+    );
+
+    detach(&mut process);
+    process
+}
+
+fn detach(process: &mut Command) {
+    // Safety: only async-signal-safe calls between fork and exec - a raw
+    // fork() plus an immediate _exit() (never std::process::exit, which
+    // isn't safe to run again after a raw fork - it may re-run Rust's
+    // normal shutdown machinery a second time).
+    unsafe {
+        process.pre_exec(|| match libc::fork() {
+            -1 => Err(io::Error::last_os_error()),
+            0 => Ok(()),
+            _ => libc::_exit(0),
+        });
+    }
+}
+
+fn configured_process(
+    command_line: &str,
+    wayland_display: &OsStr,
+    x11_display: Option<&OsStr>,
+    cursor_size: u8,
+    environment: &LaunchEnvironment,
+    extra_environment: &[(&str, &str)],
+) -> Command {
+    let mut process = Command::new("sh");
+    process.arg("-c").arg(command_line);
+    configure_environment(
+        &mut process,
+        wayland_display,
+        x11_display,
+        cursor_size,
+        environment,
+        extra_environment,
+    );
+    process
+}
+
+fn configure_environment(
+    process: &mut Command,
+    wayland_display: &OsStr,
+    x11_display: Option<&OsStr>,
+    cursor_size: u8,
+    environment: &LaunchEnvironment,
+    extra_environment: &[(&str, &str)],
+) {
+    environment.apply_to(process);
+    process
+        .env("WAYLAND_DISPLAY", wayland_display)
+        .env("XCURSOR_SIZE", cursor_size.to_string())
+        .env_remove("DISPLAY")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(display) = x11_display {
+        process.env("DISPLAY", display);
+    }
+    process.envs(extra_environment.iter().copied());
+}

@@ -1,0 +1,6 @@
+type           = internal
+restart        = false
+depends-on:    swm
+waits-for.d:   $XDG_CONFIG_HOME/dinit.d/swm.d/
+waits-for.d:   $HOME/.config/dinit.d/swm.d/
+waits-for.d:   /etc/dinit.d/user/swm.d/

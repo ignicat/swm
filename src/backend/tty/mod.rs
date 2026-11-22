@@ -1,0 +1,2047 @@
+use std::error::Error;
+use std::os::fd::OwnedFd;
+use std::time::Duration;
+
+mod composition;
+mod dmabuf;
+mod gamma;
+mod output;
+mod presentation;
+mod wake;
+
+use smithay::backend::allocator::Fourcc;
+use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::allocator::format::FormatSet;
+use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+use smithay::backend::drm::compositor::{FrameFlags, PrimaryPlaneElement};
+use smithay::backend::drm::exporter::gbm::{GbmFramebufferExporter, NodeFilter};
+use smithay::backend::drm::output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements};
+use smithay::backend::drm::{
+    DrmDevice, DrmDeviceFd, DrmDeviceNotifier, DrmNode, NodeType, VrrSupport,
+};
+use smithay::backend::egl::context::ContextPriority;
+use smithay::backend::renderer::ImportDma;
+use smithay::backend::renderer::element::solid::SolidColorRenderElement;
+use smithay::backend::renderer::element::texture::TextureRenderElement;
+use smithay::backend::renderer::element::{Element, Kind, UnderlyingStorage};
+use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
+use smithay::backend::renderer::multigpu::{GpuManager, MultiFrame, MultiRenderer};
+use smithay::backend::renderer::utils::{DamageSet, OpaqueRegions};
+use smithay::backend::renderer::{Offscreen, RendererSuper};
+use smithay::backend::session::Session;
+use smithay::backend::session::libseat::{LibSeatSession, LibSeatSessionNotifier};
+use smithay::backend::udev;
+use smithay::output::{Output, PhysicalProperties, Subpixel};
+use smithay::reexports::drm::control::{Device as _, Mode, connector, crtc};
+use smithay::reexports::rustix::fs::OFlags;
+use smithay::utils::DeviceFd;
+use smithay::utils::Scale;
+use smithay::utils::user_data::UserDataMap;
+use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
+
+use self::composition::ComposedFrame;
+use self::output::{
+    OutputState as HardwareOutputState, VrrInfo, connector_name, connector_output_info,
+    default_mode, drm_output_mode, output_diff, output_target,
+};
+use self::presentation::{DeferredFrame, Readiness};
+use super::{FrameSubmission, RenderOutcome, RenderRequest, RenderStatus, Renderable};
+use crate::render::scene::SceneElement;
+
+/// Candidate primary-plane scan-out formats, most preferred first.
+///
+/// Opaque `Xrgb8888` must come first: offering alpha-capable `Argb8888` on every
+/// CRTC enables per-pixel blending bandwidth checks that can stall multi-monitor
+/// atomic modesets on DPMS wake.
+const SUPPORTED_COLOR_FORMATS: [Fourcc; 4] = [
+    Fourcc::Xrgb8888,
+    Fourcc::Xbgr8888,
+    Fourcc::Argb8888,
+    Fourcc::Abgr8888,
+];
+
+type TtyDrmOutputManager = DrmOutputManager<
+    GbmAllocator<DrmDeviceFd>,
+    GbmFramebufferExporter<DrmDeviceFd>,
+    FrameSubmission,
+    DrmDeviceFd,
+>;
+
+type TtyGpuBackend = GbmGlesBackend<GlesRenderer, DrmDeviceFd>;
+type TtyGpuManager = GpuManager<TtyGpuBackend>;
+type TtyMultiRenderer<'render> = MultiRenderer<'render, 'render, TtyGpuBackend, TtyGpuBackend>;
+type TtyMultiFrame<'render, 'frame, 'buffer> =
+    MultiFrame<'render, 'render, 'frame, 'buffer, TtyGpuBackend, TtyGpuBackend>;
+
+trait AsGlesFrame<'frame, 'buffer> {
+    fn as_gles_frame(
+        &mut self,
+    ) -> &mut smithay::backend::renderer::gles::GlesFrame<'frame, 'buffer>;
+}
+
+impl<'frame, 'buffer> AsGlesFrame<'frame, 'buffer>
+    for smithay::backend::renderer::gles::GlesFrame<'frame, 'buffer>
+{
+    fn as_gles_frame(
+        &mut self,
+    ) -> &mut smithay::backend::renderer::gles::GlesFrame<'frame, 'buffer> {
+        self
+    }
+}
+
+impl<'render, 'frame, 'buffer> AsGlesFrame<'frame, 'buffer>
+    for TtyMultiFrame<'render, 'frame, 'buffer>
+{
+    fn as_gles_frame(
+        &mut self,
+    ) -> &mut smithay::backend::renderer::gles::GlesFrame<'frame, 'buffer> {
+        self.as_mut()
+    }
+}
+
+/// A primary-GPU texture that can be presented through Smithay's multi-GPU
+/// renderer. The desktop scene stays GlesRenderer-native; only the final
+/// composed texture crosses to an output GPU.
+struct PrimaryGpuTextureElement(
+    TextureRenderElement<smithay::backend::renderer::gles::GlesTexture>,
+);
+
+impl Element for PrimaryGpuTextureElement {
+    fn id(&self) -> &smithay::backend::renderer::element::Id {
+        self.0.id()
+    }
+
+    fn current_commit(&self) -> smithay::backend::renderer::utils::CommitCounter {
+        self.0.current_commit()
+    }
+
+    fn geometry(
+        &self,
+        scale: smithay::utils::Scale<f64>,
+    ) -> smithay::utils::Rectangle<i32, smithay::utils::Physical> {
+        self.0.geometry(scale)
+    }
+
+    fn transform(&self) -> smithay::utils::Transform {
+        self.0.transform()
+    }
+
+    fn src(&self) -> smithay::utils::Rectangle<f64, smithay::utils::Buffer> {
+        self.0.src()
+    }
+
+    fn damage_since(
+        &self,
+        scale: smithay::utils::Scale<f64>,
+        commit: Option<smithay::backend::renderer::utils::CommitCounter>,
+    ) -> DamageSet<i32, smithay::utils::Physical> {
+        self.0.damage_since(scale, commit)
+    }
+
+    fn opaque_regions(
+        &self,
+        scale: smithay::utils::Scale<f64>,
+    ) -> OpaqueRegions<i32, smithay::utils::Physical> {
+        self.0.opaque_regions(scale)
+    }
+
+    fn alpha(&self) -> f32 {
+        self.0.alpha()
+    }
+
+    fn kind(&self) -> Kind {
+        self.0.kind()
+    }
+}
+
+impl smithay::backend::renderer::element::RenderElement<GlesRenderer> for PrimaryGpuTextureElement {
+    fn draw(
+        &self,
+        frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
+        src: smithay::utils::Rectangle<f64, smithay::utils::Buffer>,
+        dst: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+        damage: &[smithay::utils::Rectangle<i32, smithay::utils::Physical>],
+        opaque_regions: &[smithay::utils::Rectangle<i32, smithay::utils::Physical>],
+        cache: Option<&UserDataMap>,
+    ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
+        smithay::backend::renderer::element::RenderElement::<GlesRenderer>::draw(
+            &self.0,
+            frame,
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            cache,
+        )
+    }
+
+    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
+        None
+    }
+}
+
+impl<'render> smithay::backend::renderer::element::RenderElement<TtyMultiRenderer<'render>>
+    for PrimaryGpuTextureElement
+{
+    fn draw(
+        &self,
+        frame: &mut TtyMultiFrame<'render, '_, '_>,
+        src: smithay::utils::Rectangle<f64, smithay::utils::Buffer>,
+        dst: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+        damage: &[smithay::utils::Rectangle<i32, smithay::utils::Physical>],
+        opaque_regions: &[smithay::utils::Rectangle<i32, smithay::utils::Physical>],
+        cache: Option<&UserDataMap>,
+    ) -> Result<(), <TtyMultiRenderer<'render> as RendererSuper>::Error> {
+        smithay::backend::renderer::element::RenderElement::<GlesRenderer>::draw(
+            &self.0,
+            frame.as_gles_frame(),
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            cache,
+        )
+        .map_err(Into::into)
+    }
+
+    fn underlying_storage(
+        &self,
+        _renderer: &mut TtyMultiRenderer<'render>,
+    ) -> Option<UnderlyingStorage<'_>> {
+        None
+    }
+}
+
+fn composed_texture_sizes(
+    mode_size: smithay::utils::Size<i32, smithay::utils::Buffer>,
+    transform: smithay::utils::Transform,
+    output_scale: Scale<f64>,
+) -> (
+    smithay::utils::Size<i32, smithay::utils::Buffer>,
+    smithay::utils::Size<i32, smithay::utils::Logical>,
+) {
+    let texture_size = transform.transform_size(mode_size);
+    let logical_size = texture_size
+        .to_f64()
+        .to_logical(output_scale, smithay::utils::Transform::Normal)
+        .to_i32_ceil();
+    (texture_size, logical_size)
+}
+
+struct TtyGpu {
+    render_node: DrmNode,
+    session_fd: Option<OwnedFd>,
+    drm_fd: DrmDeviceFd,
+    drm_output_manager: TtyDrmOutputManager,
+    notifier: Option<DrmDeviceNotifier>,
+}
+
+pub(super) type TtyDrmOutput = DrmOutput<
+    GbmAllocator<DrmDeviceFd>,
+    GbmFramebufferExporter<DrmDeviceFd>,
+    FrameSubmission,
+    DrmDeviceFd,
+>;
+
+/// One connected output plus whether it currently has a frame queued and
+/// awaiting its VBlank. DRM only produces a VBlank in response to a page
+/// flip it was actually asked to do - a scene that settles into "nothing
+/// changed" naturally queues no further frame and so never gets another
+/// VBlank at all, which was the only thing driving redraws. `pending` lets
+/// `render()` be called eagerly (e.g. on every input event, not just on
+/// VBlank) without ever double-submitting a commit for an output that's
+/// still waiting on its last one.
+struct DrmOutputEntry {
+    gpu_index: usize,
+    render_node: DrmNode,
+    crtc: crtc::Handle,
+    connector: connector::Info,
+    current_mode: Mode,
+    configured_vrr: swm_config::Vrr,
+    vrr_support: VrrSupport,
+    vrr_active: bool,
+    vrr_failure_warned_for: Option<bool>,
+    direct_scanout_active: Option<bool>,
+    output: Output,
+    drm_output: TtyDrmOutput,
+    dmabuf_feedback: Option<super::dmabuf::SurfaceDmabufFeedback>,
+    pending: bool,
+    deferred_frame: Option<DeferredFrame>,
+    dpms_enabled: bool,
+    enabled: bool,
+    gamma: gamma::GammaState,
+    /// Temporary amdgpu workaround: see [`wake`].
+    wake: wake::WakeProgress,
+    // Retained composition belongs to this output's lifetime, not its name.
+    composed_frame: Option<ComposedFrame<smithay::backend::renderer::gles::GlesTexture>>,
+}
+
+#[derive(Debug)]
+pub struct AppliedDpmsChange {
+    pub output: Output,
+}
+
+#[derive(Debug)]
+pub struct AppliedDpms {
+    pub changes: Vec<AppliedDpmsChange>,
+    pub error: Option<String>,
+}
+
+pub struct AppliedOutputChange {
+    pub output: Output,
+    pub enabled_changed: bool,
+    pub mode_changed: bool,
+    pub size_changed: bool,
+    pub layout_changed: bool,
+    pub scale_changed: bool,
+}
+
+/// Hardware DRM/KMS backend owning GPU devices, connectors, and outputs.
+///
+/// Every connected output must be initialized at startup; leaving a connector
+/// un-negotiated can freeze CRTC commits during another output's atomic modeset
+/// on AMD hardware. `session` is kept only for VT pause/resume handling.
+pub struct TtyBackend {
+    session: LibSeatSession,
+    gpu_manager: TtyGpuManager,
+    gpus: Vec<TtyGpu>,
+    drm_outputs: Vec<DrmOutputEntry>,
+    /// The `wl_output` where newly mapped windows begin.
+    primary_output: Output,
+    /// Every successfully initialized output, in connector-scan order - each
+    /// one has its real name and configured mode/position/transform. Driving
+    /// code advertises and maps all of them into Smithay's `Space`.
+    outputs: Vec<Output>,
+    /// IPC inventory for every physically connected connector, including
+    /// connectors which had no usable CRTC/mode or failed initialization.
+    /// Connected outputs are discovered at startup; active entries are
+    /// updated as configuration changes are applied.
+    ipc_output_info: Vec<swm_ipc::OutputInfo>,
+    power_unavailable: Vec<Output>,
+    power_removed_devices: Vec<libc::dev_t>,
+    primary_render_node: DrmNode,
+    primary_formats: FormatSet,
+}
+
+impl TtyBackend {
+    /// Opens the seat, probes all GPUs, and initializes each connected connector.
+    /// Returns the session and DRM notifiers for the event loop to register.
+    pub fn new(
+        outputs_config: &[swm_config::OutputConfig],
+    ) -> Result<(TtyBackend, LibSeatSessionNotifier, Vec<DrmDeviceNotifier>), Box<dyn Error>> {
+        let (mut session, session_notifier) = LibSeatSession::new()?;
+        let candidates = udev::all_gpus(session.seat())?;
+        let mut gpu_manager =
+            GpuManager::new(GbmGlesBackend::with_context_priority(ContextPriority::High))?;
+        let mut gpus = Vec::new();
+        let mut drm_outputs = Vec::new();
+        let mut outputs = Vec::new();
+        let mut ipc_output_info = Vec::new();
+        let mut primary_output = None;
+        let mut primary_render_node = None;
+
+        for gpu_path in candidates {
+            let path_label = gpu_path.display().to_string();
+            let fd = match session.open(
+                &gpu_path,
+                OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
+            ) {
+                Ok(fd) => fd,
+                Err(err) => {
+                    eventline::warn!("tty: failed to open GPU {path_label}: {err}");
+                    continue;
+                }
+            };
+            let mut session_fd = Some(fd);
+            let mut added_render_node = None;
+            type GpuProbe = (TtyGpu, Vec<DrmOutputEntry>, Vec<Output>);
+            let probe = (|| -> Result<GpuProbe, Box<dyn Error>> {
+                let node = DrmNode::from_path(&gpu_path)?;
+                let render_node = node
+                    .node_with_type(NodeType::Render)
+                    .and_then(Result::ok)
+                    .unwrap_or(node);
+                let drm_fd = DrmDeviceFd::new(DeviceFd::from(
+                    session_fd
+                        .as_ref()
+                        .expect("session fd remains owned during GPU probe")
+                        .try_clone()?,
+                ));
+                let (drm, notifier) = DrmDevice::new(drm_fd.clone(), false)?;
+                let mut scanner: DrmScanner = DrmScanner::new();
+                let connected = scanner
+                    .scan_connectors(&drm)?
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        DrmScanEvent::Connected { connector, crtc } => Some((connector, crtc)),
+                        DrmScanEvent::Disconnected { .. } => None,
+                        DrmScanEvent::Changed { .. } => None,
+                    })
+                    .collect::<Vec<_>>();
+                if connected.is_empty() {
+                    return Err("no connected connector found".into());
+                }
+
+                let gbm = GbmDevice::new(drm_fd.clone())?;
+                gpu_manager.as_mut().add_node(render_node, gbm.clone())?;
+                added_render_node = Some(render_node);
+                let renderer_formats = {
+                    let renderer = gpu_manager.single_renderer(&render_node)?;
+                    renderer
+                        .dmabuf_formats()
+                        .iter()
+                        .copied()
+                        .collect::<Vec<_>>()
+                };
+                let allocator = GbmAllocator::new(
+                    gbm.clone(),
+                    GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
+                );
+                let exporter = GbmFramebufferExporter::new(gbm.clone(), NodeFilter::All);
+                let mut manager = TtyDrmOutputManager::new(
+                    drm,
+                    allocator,
+                    exporter,
+                    Some(gbm),
+                    SUPPORTED_COLOR_FORMATS,
+                    renderer_formats,
+                );
+                let gpu_index = gpus.len();
+                let mut entries = Vec::new();
+                let mut gpu_outputs = Vec::new();
+                for (connector, crtc) in connected {
+                    let name = connector_name(&connector);
+                    let configured = outputs_config.iter().find(|cfg| cfg.name == name);
+                    let target = output_target(&connector, configured);
+                    let offset = target.offset;
+                    let vrr = target.vrr;
+                    if connector.modes().is_empty() {
+                        eventline::warn!(
+                            "output {name:?}: connected connector advertises no modes"
+                        );
+                        ipc_output_info.push(connector_output_info(
+                            name,
+                            &connector,
+                            None,
+                            offset,
+                            VrrInfo {
+                                configured: vrr,
+                                supported: false,
+                                active: false,
+                            },
+                            target.scale,
+                        ));
+                        continue;
+                    }
+                    let Some(crtc) = crtc else {
+                        eventline::warn!(
+                            "output {name:?}: connected connector has no available CRTC"
+                        );
+                        ipc_output_info.push(connector_output_info(
+                            name,
+                            &connector,
+                            None,
+                            offset,
+                            VrrInfo {
+                                configured: vrr,
+                                supported: false,
+                                active: false,
+                            },
+                            target.scale,
+                        ));
+                        continue;
+                    };
+                    let mode = target.mode;
+                    let output = Output::new(
+                        name.clone(),
+                        PhysicalProperties {
+                            size: (0, 0).into(),
+                            subpixel: Subpixel::Unknown,
+                            make: "swm-next".into(),
+                            model: "tty".into(),
+                            serial_number: "unknown".into(),
+                        },
+                    );
+                    output.change_current_state(
+                        Some(drm_output_mode(&mode)),
+                        Some(target.transform),
+                        Some(smithay::output::Scale::Fractional(target.scale)),
+                        Some(offset.into()),
+                    );
+                    output.set_preferred(drm_output_mode(&default_mode(&connector)));
+                    let result = {
+                        let mut renderer = gpu_manager.single_renderer(&render_node)?;
+                        manager
+                            .lock()
+                            .initialize_output::<GlesRenderer, SolidColorRenderElement>(
+                                crtc,
+                                mode,
+                                &[connector.handle()],
+                                &output,
+                                None,
+                                renderer.as_mut(),
+                                &DrmOutputRenderElements::default(),
+                            )
+                    };
+                    match result {
+                        Ok(drm_output) => {
+                            let vrr_support =
+                                query_vrr_support(&drm_output, connector.handle(), &name);
+                            let requested_vrr = configured_vrr_target(vrr, false, vrr_support);
+                            if let Err(err) = drm_output
+                                .with_compositor(|compositor| compositor.use_vrr(requested_vrr))
+                            {
+                                eventline::warn!(
+                                    "output {name:?}: failed to set initial VRR state to {requested_vrr}: {err}"
+                                );
+                            }
+                            let vrr_active =
+                                drm_output.with_compositor(|compositor| compositor.vrr_enabled());
+                            warn_vrr_configuration(&name, vrr, vrr_support);
+                            primary_output.get_or_insert_with(|| output.clone());
+                            gpu_outputs.push(output.clone());
+                            ipc_output_info.push(connector_output_info(
+                                name,
+                                &connector,
+                                Some(mode),
+                                offset,
+                                VrrInfo {
+                                    configured: vrr,
+                                    supported: vrr_is_supported(vrr_support),
+                                    active: vrr_active,
+                                },
+                                target.scale,
+                            ));
+                            let gamma = gamma::GammaState::new(manager.device(), crtc);
+                            entries.push(DrmOutputEntry {
+                                gpu_index,
+                                render_node,
+                                crtc,
+                                connector,
+                                current_mode: mode,
+                                configured_vrr: vrr,
+                                vrr_support,
+                                vrr_active,
+                                vrr_failure_warned_for: None,
+                                direct_scanout_active: None,
+                                wake: wake::WakeProgress::default(),
+                                output,
+                                drm_output,
+                                dmabuf_feedback: None,
+                                pending: false,
+                                deferred_frame: None,
+                                dpms_enabled: true,
+                                enabled: true,
+                                gamma,
+                                composed_frame: None,
+                            });
+                        }
+                        Err(err) => {
+                            eventline::error!("failed to initialize output {name:?}: {err}");
+                            ipc_output_info.push(connector_output_info(
+                                name,
+                                &connector,
+                                None,
+                                offset,
+                                VrrInfo {
+                                    configured: vrr,
+                                    supported: false,
+                                    active: false,
+                                },
+                                target.scale,
+                            ));
+                        }
+                    }
+                }
+                if entries.is_empty() {
+                    return Err("no output could be initialized".into());
+                }
+                Ok((
+                    TtyGpu {
+                        render_node,
+                        session_fd: Some(
+                            session_fd
+                                .take()
+                                .expect("session fd is transferred to the live GPU"),
+                        ),
+                        drm_fd,
+                        drm_output_manager: manager,
+                        notifier: Some(notifier),
+                    },
+                    entries,
+                    gpu_outputs,
+                ))
+            })();
+            match probe {
+                Ok((gpu, entries, gpu_outputs)) => {
+                    if primary_render_node.is_none() {
+                        primary_render_node = Some(gpu.render_node);
+                    }
+                    outputs.extend(gpu_outputs);
+                    drm_outputs.extend(entries);
+                    gpus.push(gpu);
+                }
+                Err(err) => {
+                    if let Some(render_node) = added_render_node {
+                        gpu_manager.as_mut().remove_node(&render_node);
+                    }
+                    if let Some(fd) = session_fd.take() {
+                        let _ = session.close(fd);
+                    }
+                    eventline::warn!("tty: GPU {path_label} probe failed: {err}");
+                }
+            }
+        }
+
+        let primary_render_node = primary_render_node.ok_or("no usable GPU found on seat")?;
+        let primary_formats = {
+            let renderer = gpu_manager.single_renderer(&primary_render_node)?;
+            renderer.dmabuf_formats().clone()
+        };
+        for entry in &mut drm_outputs {
+            entry.dmabuf_feedback = dmabuf::surface_feedback(
+                &entry.drm_output,
+                primary_formats.clone(),
+                primary_render_node,
+                entry.render_node,
+            )
+            .ok();
+        }
+        let primary_output = primary_output.ok_or("no output could be initialized")?;
+        let drm_notifiers = gpus
+            .iter_mut()
+            .filter_map(|gpu| gpu.notifier.take())
+            .collect::<Vec<_>>();
+        if !gpus
+            .iter()
+            .any(|gpu| gpu.render_node == primary_render_node)
+        {
+            return Err("primary GPU device disappeared during setup".into());
+        }
+        // No globals or clients exist yet. Publish one consistent nonnegative
+        // layout, so XWayland's root includes heads configured left/above zero.
+        let origin = super::output_layout::LayoutOrigin::for_locations(
+            drm_outputs
+                .iter()
+                .filter(|entry| entry.enabled)
+                .map(|entry| entry.output.current_location()),
+        );
+        let effective = drm_outputs
+            .iter()
+            .map(|entry| origin.effective(entry.output.current_location()))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (entry, location) in drm_outputs.iter().zip(effective) {
+            entry
+                .output
+                .change_current_state(None, None, None, Some(location));
+            if let Some(info) = ipc_output_info
+                .iter_mut()
+                .find(|info| info.name == entry.output.name())
+            {
+                info.offset_x = location.x;
+                info.offset_y = location.y;
+            }
+        }
+        let backend = TtyBackend {
+            session,
+            gpu_manager,
+            gpus,
+            drm_outputs,
+            primary_output,
+            outputs,
+            ipc_output_info,
+            power_unavailable: Vec::new(),
+            power_removed_devices: Vec::new(),
+            primary_render_node,
+            primary_formats,
+        };
+        Ok((backend, session_notifier, drm_notifiers))
+    }
+
+    /// The `wl_output` used for primary-only window rendering and frame
+    /// callbacks.
+    pub fn primary_output(&self) -> &Output {
+        &self.primary_output
+    }
+
+    /// Primary DRM device used for demand-driven explicit synchronization.
+    pub fn drm_device_fd(&self) -> &DrmDeviceFd {
+        self.gpus
+            .iter()
+            .find(|gpu| gpu.render_node == self.primary_render_node)
+            .map(|gpu| &gpu.drm_fd)
+            .expect("primary GPU remains present for backend lifetime")
+    }
+
+    /// Every initialized `wl_output`, for registering globals and mapping
+    /// the configured layout into Smithay's `Space`.
+    pub fn outputs(&self) -> impl Iterator<Item = &Output> {
+        self.outputs.iter()
+    }
+
+    pub fn output_for_crtc(&self, gpu_index: usize, crtc: crtc::Handle) -> Option<&Output> {
+        self.drm_outputs
+            .iter()
+            .find(|entry| entry.gpu_index == gpu_index && entry.crtc == crtc)
+            .map(|entry| &entry.output)
+    }
+
+    pub fn output_dpms_enabled(&self, output: &Output) -> bool {
+        if self.power_unavailable.contains(output) {
+            return false;
+        }
+        self.drm_outputs
+            .iter()
+            .find(|entry| &entry.output == output)
+            .is_none_or(|entry| entry.enabled && entry.dpms_enabled)
+    }
+
+    /// Observe connector loss without introducing display-layout hotplug policy.
+    /// Non-forcing queries use the kernel's cached connector state.
+    pub fn output_power_device_removed(&mut self, device_id: libc::dev_t) {
+        if !self.power_removed_devices.contains(&device_id) {
+            self.power_removed_devices.push(device_id);
+        }
+        self.refresh_output_power_support();
+    }
+
+    pub fn refresh_output_power_support(&mut self) {
+        self.power_unavailable = self
+            .drm_outputs
+            .iter()
+            .filter(|entry| {
+                self.power_removed_devices.contains(
+                    &self.gpus[entry.gpu_index]
+                        .drm_output_manager
+                        .device()
+                        .device_id(),
+                ) || !self.gpus[entry.gpu_index]
+                    .drm_fd
+                    .get_connector(entry.connector.handle(), false)
+                    .is_ok_and(|connector| connector.state() == connector::State::Connected)
+            })
+            .map(|entry| entry.output.clone())
+            .collect();
+    }
+
+    pub fn output_power(&self, output: &Output) -> Option<bool> {
+        if self.power_unavailable.contains(output) {
+            return None;
+        }
+        self.drm_outputs
+            .iter()
+            .find(|entry| entry.output == *output && entry.enabled)
+            .map(|entry| entry.dpms_enabled)
+    }
+
+    pub fn output_vrr_active(&self, output: &Output) -> bool {
+        self.drm_outputs
+            .iter()
+            .find(|entry| &entry.output == output)
+            .is_some_and(|entry| entry.vrr_active)
+    }
+
+    pub fn any_output_dpms_enabled(&self) -> bool {
+        self.drm_outputs.iter().any(|entry| {
+            entry.enabled && entry.dpms_enabled && !self.power_unavailable.contains(&entry.output)
+        })
+    }
+
+    pub fn gamma_size(&self, output: &Output) -> Result<u32, String> {
+        let entry = self
+            .drm_outputs
+            .iter()
+            .find(|entry| entry.output == *output && entry.enabled)
+            .ok_or_else(|| format!("output {:?} is not enabled", output.name()))?;
+        entry
+            .gamma
+            .size(self.gpus[entry.gpu_index].drm_output_manager.device())
+    }
+
+    pub fn set_gamma(&mut self, output: &Output, ramp: Option<Vec<u16>>) -> Result<(), String> {
+        let active = self.session.is_active();
+        let index = self
+            .drm_outputs
+            .iter()
+            .find(|entry| entry.output == *output)
+            .map(|entry| entry.gpu_index)
+            .ok_or_else(|| format!("output {:?} is not connected", output.name()))?;
+        let entry_index = self
+            .drm_outputs
+            .iter()
+            .position(|entry| entry.output == *output)
+            .expect("output index was found above");
+        let device = self.gpus[index].drm_output_manager.device();
+        let entry = &mut self.drm_outputs[entry_index];
+        if !entry.enabled && ramp.is_some() {
+            return Err(format!("output {:?} is not enabled", output.name()));
+        }
+        entry.gamma.set(device, ramp, active)
+    }
+
+    pub fn output_states(&self) -> Vec<crate::session::output::OutputState> {
+        self.drm_outputs
+            .iter()
+            .map(|entry| crate::session::output::OutputState {
+                output: entry.output.clone(),
+                enabled: entry.enabled,
+                mode: drm_output_mode(&entry.current_mode),
+                location: entry.output.current_location(),
+                transform: entry.output.current_transform(),
+                scale: entry.output.current_scale().fractional_scale(),
+                adaptive_sync: entry.configured_vrr != swm_config::Vrr::Off,
+                adaptive_sync_supported: vrr_is_supported(entry.vrr_support),
+            })
+            .collect()
+    }
+
+    pub fn test_output_configuration(
+        &mut self,
+        configuration: &[crate::session::output::OutputConfiguration],
+    ) -> Result<(), String> {
+        let current = self.output_states();
+        crate::session::output::validate_complete_configuration(&current, configuration)?;
+        for config in configuration {
+            let name = config.output.name();
+            let entry = self
+                .drm_outputs
+                .iter()
+                .find(|entry| entry.output == config.output)
+                .ok_or_else(|| format!("output {name:?} is not connected"))?;
+            if !entry
+                .connector
+                .modes()
+                .iter()
+                .any(|mode| drm_output_mode(mode) == config.mode)
+            {
+                return Err(format!(
+                    "output {name:?} requested an unadvertised DRM mode"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn apply_runtime_output_configuration(
+        &mut self,
+        configuration: &[crate::session::output::OutputConfiguration],
+    ) -> Result<Vec<crate::session::output::OutputChange>, String> {
+        self.test_output_configuration(configuration)?;
+        let before = self.output_states();
+        let snapshots = self
+            .drm_outputs
+            .iter()
+            .map(|entry| {
+                (
+                    entry.current_mode,
+                    entry.output.current_location(),
+                    entry.output.current_transform(),
+                    entry.output.current_scale(),
+                    entry.configured_vrr,
+                    entry.enabled,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut failure = None;
+        for entry in &mut self.drm_outputs {
+            entry.discard_deferred_frame();
+        }
+        for config in configuration {
+            let index = self
+                .drm_outputs
+                .iter()
+                .position(|entry| entry.output == config.output)
+                .expect("configuration was validated against connected outputs");
+            let target_mode = self.drm_outputs[index]
+                .connector
+                .modes()
+                .iter()
+                .find(|mode| drm_output_mode(mode) == config.mode)
+                .copied()
+                .expect("configuration mode was validated");
+
+            if target_mode != self.drm_outputs[index].current_mode {
+                let result = self.use_output_mode(index, target_mode);
+                if let Err(err) = result {
+                    failure = Some(format!(
+                        "output {:?}: mode preflight failed: {err}",
+                        config.output.name()
+                    ));
+                    break;
+                }
+            }
+
+            if !config.enabled
+                && self.drm_outputs[index].enabled
+                && let Err(err) = self.drm_outputs[index]
+                    .drm_output
+                    .with_compositor(|compositor| compositor.clear())
+            {
+                failure = Some(format!(
+                    "output {:?}: failed to disable connector: {err}",
+                    config.output.name()
+                ));
+                break;
+            }
+
+            let entry = &mut self.drm_outputs[index];
+            entry.current_mode = target_mode;
+            entry.enabled = config.enabled;
+            entry.configured_vrr = if config.adaptive_sync {
+                swm_config::Vrr::On
+            } else {
+                swm_config::Vrr::Off
+            };
+            entry.output.change_current_state(
+                Some(config.mode),
+                Some(config.transform),
+                Some(smithay::output::Scale::Fractional(
+                    swm_config::output::normalize_scale(config.scale).expect("validated scale"),
+                )),
+                Some(config.location),
+            );
+            let requested_vrr =
+                configured_vrr_target(entry.configured_vrr, false, entry.vrr_support);
+            set_entry_vrr(entry, requested_vrr);
+            entry.pending = false;
+            entry.wake.reset();
+        }
+
+        if let Some(error) = failure {
+            let mut rollback_errors = Vec::new();
+            for (index, snapshot) in snapshots.iter().enumerate() {
+                let (mode, location, transform, scale, vrr, enabled) = *snapshot;
+                let mode_restored = if self.drm_outputs[index].current_mode != mode {
+                    match self.use_output_mode(index, mode) {
+                        Ok(()) => true,
+                        Err(err) => {
+                            rollback_errors.push(format!(
+                                "output {:?}: mode rollback failed: {err}",
+                                self.drm_outputs[index].output.name()
+                            ));
+                            false
+                        }
+                    }
+                } else {
+                    true
+                };
+                let entry = &mut self.drm_outputs[index];
+                if mode_restored {
+                    entry.current_mode = mode;
+                    entry.output.change_current_state(
+                        Some(drm_output_mode(&mode)),
+                        Some(transform),
+                        Some(scale),
+                        Some(location),
+                    );
+                }
+                entry.configured_vrr = vrr;
+                entry.enabled = enabled;
+                set_entry_vrr(entry, configured_vrr_target(vrr, false, entry.vrr_support));
+                entry.pending = false;
+                entry.wake.reset();
+            }
+            if rollback_errors.is_empty() {
+                return Err(error);
+            }
+            return Err(format!("{error}; {}", rollback_errors.join("; ")));
+        }
+
+        let after = self.output_states();
+        for entry in &mut self.drm_outputs {
+            let name = entry.output.name();
+            if let Some(info) = self
+                .ipc_output_info
+                .iter_mut()
+                .find(|info| info.name == name)
+            {
+                info.current_mode = entry
+                    .enabled
+                    .then(|| {
+                        entry
+                            .connector
+                            .modes()
+                            .iter()
+                            .position(|mode| *mode == entry.current_mode)
+                    })
+                    .flatten();
+                let location = entry.output.current_location();
+                info.offset_x = location.x;
+                info.offset_y = location.y;
+                info.scale = entry.output.current_scale().fractional_scale();
+                info.vrr = crate::ipc::vrr_str(entry.configured_vrr).to_string();
+                info.vrr_active = entry.vrr_active && entry.enabled && entry.dpms_enabled;
+            }
+        }
+
+        Ok(before
+            .into_iter()
+            .zip(after)
+            .filter(|(before, after)| {
+                before.enabled != after.enabled
+                    || before.mode != after.mode
+                    || before.location != after.location
+                    || before.transform != after.transform
+                    || before.scale != after.scale
+                    || before.adaptive_sync != after.adaptive_sync
+            })
+            .map(|(before, after)| crate::session::output::OutputChange { before, after })
+            .collect())
+    }
+
+    pub fn apply_dpms(
+        &mut self,
+        command: swm_ipc::DpmsCommand,
+        output_name: Option<&str>,
+    ) -> Result<AppliedDpms, swm_ipc::ServerError> {
+        let targets = match output_name {
+            Some(name) => {
+                let index = self
+                    .drm_outputs
+                    .iter()
+                    .position(|entry| entry.output.name() == name)
+                    .ok_or_else(|| {
+                        swm_ipc::ServerError::new(
+                            swm_ipc::ServerErrorKind::NotFound,
+                            format!("unknown active output {name:?}"),
+                        )
+                    })?;
+                vec![index]
+            }
+            None => self
+                .drm_outputs
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| {
+                    entry.enabled && !self.power_unavailable.contains(&entry.output)
+                })
+                .map(|(index, _)| index)
+                .collect(),
+        };
+        if targets.is_empty() {
+            return Err(swm_ipc::ServerError::new(
+                swm_ipc::ServerErrorKind::InvalidRequest,
+                "dpms request has no active output targets",
+            ));
+        }
+        if targets.iter().any(|index| {
+            let entry = &self.drm_outputs[*index];
+            !entry.enabled || self.power_unavailable.contains(&entry.output)
+        }) {
+            return Err(swm_ipc::ServerError::new(
+                swm_ipc::ServerErrorKind::InvalidRequest,
+                "dpms target is disabled or disconnected",
+            ));
+        }
+        let target_enabled = dpms_target_enabled(
+            command,
+            targets
+                .iter()
+                .map(|index| self.drm_outputs[*index].dpms_enabled),
+        )
+        .ok_or_else(|| {
+            swm_ipc::ServerError::new(
+                swm_ipc::ServerErrorKind::InvalidRequest,
+                "dpms request has no active output targets",
+            )
+        })?;
+        if targets
+            .iter()
+            .all(|index| self.drm_outputs[*index].dpms_enabled == target_enabled)
+        {
+            return Ok(AppliedDpms {
+                changes: Vec::new(),
+                error: None,
+            });
+        }
+
+        let mut changes = Vec::new();
+        let mut failures = Vec::new();
+        for index in targets {
+            let entry = &mut self.drm_outputs[index];
+            if entry.dpms_enabled == target_enabled {
+                continue;
+            }
+            entry.discard_deferred_frame();
+            // Do nothing on power-on: the CRTC re-enables on the first ordinary
+            // frame commit. `reset_state()` belongs in `resume()` for VT switches;
+            // calling it here stalled multi-output DPMS wakes for ~25s.
+            // `clear()` guarantees `commit_pending()` is true, so the next frame
+            // is a full non-empty commit.
+            if !target_enabled {
+                set_entry_vrr(entry, false);
+                let clear = entry
+                    .drm_output
+                    .with_compositor(|compositor| compositor.clear());
+                if let Err(err) = clear {
+                    failures.push(format!("{}: {err}", entry.output.name()));
+                    continue;
+                }
+                entry.direct_scanout_active = None;
+            }
+            entry.dpms_enabled = target_enabled;
+            entry.pending = false;
+            if target_enabled {
+                entry.wake.woken(std::time::Instant::now());
+            } else {
+                entry.wake.reset();
+            }
+            changes.push(AppliedDpmsChange {
+                output: entry.output.clone(),
+            });
+        }
+
+        if !changes.is_empty() {
+            let names = changes
+                .iter()
+                .map(|change| change.output.name())
+                .collect::<Vec<_>>()
+                .join(", ");
+            eventline::debug!(
+                "tty dpms: {} outputs {names}",
+                if target_enabled {
+                    "powering on"
+                } else {
+                    "powered off"
+                }
+            );
+        }
+        Ok(AppliedDpms {
+            changes,
+            error: (!failures.is_empty()).then(|| {
+                format!(
+                    "failed to power {} outputs: {}",
+                    if target_enabled { "on" } else { "off" },
+                    failures.join(", ")
+                )
+            }),
+        })
+    }
+
+    pub fn dmabuf_capabilities(&self) -> super::dmabuf::DmabufCapabilities {
+        super::dmabuf::DmabufCapabilities::new(
+            Some(self.primary_render_node.dev_id()),
+            self.primary_formats.clone(),
+        )
+    }
+
+    pub fn import_dmabuf(&mut self, dmabuf: &Dmabuf) -> bool {
+        let mut renderer = match self.gpu_manager.single_renderer(&self.primary_render_node) {
+            Ok(renderer) => renderer,
+            Err(err) => {
+                eventline::debug!("tty: primary renderer unavailable for DMA-BUF import: {err:?}");
+                return false;
+            }
+        };
+        match renderer.import_dmabuf(dmabuf, None) {
+            Ok(_) => {
+                dmabuf.set_node(Some(self.primary_render_node));
+                true
+            }
+            Err(err) => {
+                eventline::debug!("tty: failed to import DMA-BUF: {err}");
+                false
+            }
+        }
+    }
+
+    pub fn dmabuf_feedback(
+        &self,
+        output: &Output,
+    ) -> Option<&super::dmabuf::SurfaceDmabufFeedback> {
+        self.drm_outputs
+            .iter()
+            .find(|entry| &entry.output == output)
+            .and_then(|entry| entry.dmabuf_feedback.as_ref())
+    }
+
+    pub fn refresh_interval_for_output(&self, output: &Output) -> Duration {
+        self.drm_outputs
+            .iter()
+            .find(|entry| &entry.output == output)
+            .and_then(|entry| entry.output.current_mode())
+            .map(|mode| mode.refresh)
+            .filter(|&refresh| refresh > 0)
+            .map(|refresh| Duration::from_secs_f64(1000.0 / refresh as f64))
+            .unwrap_or_else(|| Duration::from_secs_f64(1.0 / 60.0))
+    }
+
+    fn use_output_mode(&mut self, index: usize, mode: Mode) -> Result<(), String> {
+        self.drm_outputs[index].discard_deferred_frame();
+        let target_node = self.drm_outputs[index].render_node;
+        if target_node == self.primary_render_node {
+            let mut renderer = self
+                .gpu_manager
+                .single_renderer(&self.primary_render_node)
+                .map_err(|err| format!("primary renderer unavailable: {err:?}"))?;
+            self.drm_outputs[index]
+                .drm_output
+                .use_mode::<GlesRenderer, SolidColorRenderElement>(
+                    mode,
+                    renderer.as_mut(),
+                    &DrmOutputRenderElements::default(),
+                )
+                .map_err(|err| format!("{err}"))
+        } else {
+            let output_format = self.drm_outputs[index].drm_output.format();
+            let mut renderer = self
+                .gpu_manager
+                .renderer(&self.primary_render_node, &target_node, output_format)
+                .map_err(|err| format!("multi-GPU renderer unavailable: {err:?}"))?;
+            let render_elements =
+                DrmOutputRenderElements::<TtyMultiRenderer<'_>, PrimaryGpuTextureElement>::default(
+                );
+            self.drm_outputs[index]
+                .drm_output
+                .use_mode::<TtyMultiRenderer<'_>, PrimaryGpuTextureElement>(
+                    mode,
+                    &mut renderer,
+                    &render_elements,
+                )
+                .map_err(|err| format!("{err}"))
+        }
+    }
+
+    /// Applies only effective per-output differences. In particular, a
+    /// changed DP-1 block never modesets DP-2. A shared origin change can
+    /// still move both outputs' logical positions together.
+    pub fn apply_output_config(
+        &mut self,
+        outputs_config: &[swm_config::OutputConfig],
+    ) -> Vec<AppliedOutputChange> {
+        let mut changes = Vec::new();
+
+        // Resolve the entire requested layout before comparing any output.
+        // Always use raw config offsets here, never previously shifted ones.
+        let mut targets = self
+            .drm_outputs
+            .iter()
+            .map(|entry| {
+                let configured = outputs_config
+                    .iter()
+                    .find(|cfg| cfg.name == entry.output.name());
+                output_target(&entry.connector, configured)
+            })
+            .collect::<Vec<_>>();
+        let origin = super::output_layout::LayoutOrigin::for_locations(
+            targets.iter().map(|target| target.offset.into()),
+        );
+        for target in &mut targets {
+            match origin.effective(target.offset.into()) {
+                Ok(location) => target.offset = (location.x, location.y),
+                Err(error) => {
+                    eventline::error!("output layout unchanged: {error}");
+                    return changes;
+                }
+            }
+        }
+
+        for (index, target) in targets.into_iter().enumerate() {
+            let (target, diff, enable_changed) = {
+                let entry = &self.drm_outputs[index];
+                let location = entry.output.current_location();
+                let current = HardwareOutputState {
+                    mode: drm_output_mode(&entry.current_mode),
+                    offset: (location.x, location.y),
+                    transform: entry.output.current_transform(),
+                    vrr: entry.configured_vrr,
+                    scale: entry.output.current_scale().fractional_scale(),
+                };
+                let requested = HardwareOutputState {
+                    mode: drm_output_mode(&target.mode),
+                    offset: target.offset,
+                    transform: target.transform,
+                    vrr: target.vrr,
+                    scale: target.scale,
+                };
+                (target, output_diff(current, requested), !entry.enabled)
+            };
+
+            if !(diff.mode_changed
+                || diff.offset_changed
+                || diff.transform_changed
+                || diff.vrr_changed
+                || diff.scale_changed
+                || enable_changed)
+            {
+                continue;
+            }
+
+            self.drm_outputs[index].discard_deferred_frame();
+            if diff.mode_changed {
+                let result = self.use_output_mode(index, target.mode);
+                if let Err(err) = result {
+                    let name = self.drm_outputs[index].output.name();
+                    eventline::error!(
+                        "output {name:?}: failed to apply configured mode, keeping previous state: {err}"
+                    );
+                    continue;
+                }
+            }
+
+            let (name, output, connector, current_mode, configured_vrr, vrr_supported, vrr_active) = {
+                let entry = &mut self.drm_outputs[index];
+                entry.output.change_current_state(
+                    diff.mode_changed.then(|| drm_output_mode(&target.mode)),
+                    diff.transform_changed.then_some(target.transform),
+                    diff.scale_changed
+                        .then_some(smithay::output::Scale::Fractional(target.scale)),
+                    diff.offset_changed.then(|| target.offset.into()),
+                );
+                entry.current_mode = target.mode;
+                entry.configured_vrr = target.vrr;
+                entry.enabled = true;
+                if diff.mode_changed {
+                    entry.vrr_support = query_vrr_support(
+                        &entry.drm_output,
+                        entry.connector.handle(),
+                        &entry.output.name(),
+                    );
+                }
+                let requested_vrr = configured_vrr_target(target.vrr, false, entry.vrr_support);
+                set_entry_vrr(entry, requested_vrr);
+                if diff.mode_changed || diff.vrr_changed {
+                    warn_vrr_configuration(&entry.output.name(), target.vrr, entry.vrr_support);
+                }
+                (
+                    entry.output.name(),
+                    entry.output.clone(),
+                    entry.connector.clone(),
+                    entry.current_mode,
+                    entry.configured_vrr,
+                    vrr_is_supported(entry.vrr_support),
+                    entry.vrr_active,
+                )
+            };
+
+            if !self.drm_outputs[index].dpms_enabled {
+                let entry = &mut self.drm_outputs[index];
+                if let Err(err) = entry
+                    .drm_output
+                    .with_compositor(|compositor| compositor.clear())
+                {
+                    eventline::error!(
+                        "output {name:?}: failed to restore DPMS-off state after configuration: {err}"
+                    );
+                }
+                entry.pending = false;
+            }
+
+            let info = connector_output_info(
+                name.clone(),
+                &connector,
+                Some(current_mode),
+                {
+                    let location = output.current_location();
+                    (location.x, location.y)
+                },
+                VrrInfo {
+                    configured: configured_vrr,
+                    supported: vrr_supported,
+                    active: vrr_active,
+                },
+                output.current_scale().fractional_scale(),
+            );
+            if let Some(existing) = self
+                .ipc_output_info
+                .iter_mut()
+                .find(|existing| existing.name == name)
+            {
+                *existing = info;
+            }
+
+            changes.push(AppliedOutputChange {
+                output,
+                enabled_changed: enable_changed,
+                mode_changed: diff.mode_changed,
+                size_changed: enable_changed || diff.size_changed || diff.scale_changed,
+                scale_changed: diff.scale_changed,
+                layout_changed: enable_changed
+                    || diff.size_changed
+                    || diff.scale_changed
+                    || diff.offset_changed
+                    || diff.transform_changed,
+            });
+        }
+
+        changes
+    }
+
+    /// Reacquires DRM master and resyncs KMS state after a VT switch back.
+    pub fn resume(&mut self) -> Result<(), Box<dyn Error>> {
+        for gpu in &mut self.gpus {
+            gpu.drm_output_manager.lock().activate(false)?;
+        }
+        self.recover_outputs_after_loss("VT activation");
+        Ok(())
+    }
+
+    /// Discard scan-out state after system sleep, where logind keeps the
+    /// session active and libseat therefore emits no activate event.
+    #[cfg(feature = "dbus")]
+    pub fn recover_after_system_sleep(&mut self) {
+        self.recover_outputs_after_loss("system resume");
+    }
+
+    fn recover_outputs_after_loss(&mut self, reason: &str) {
+        self.refresh_output_power_support();
+        // Any frame that was in flight before the VT switch away is gone -
+        // without this, a stale `pending` would permanently block that
+        // output from rendering again (its VBlank is never coming).
+        for entry in &mut self.drm_outputs {
+            entry.discard_deferred_frame();
+            entry.composed_frame = None;
+            entry.pending = false;
+            entry.wake.reset();
+            entry.direct_scanout_active = None;
+            entry.vrr_failure_warned_for = None;
+            // The manager activation above refreshes each compositor's KMS
+            // state. Drop its pre-switch scan-out buffers as well so the
+            // first frame after returning cannot reuse storage owned by the
+            // previous DRM-master epoch.
+            entry.drm_output.reset_buffers();
+            if let Err(err) = entry
+                .gamma
+                .restore_after_resume(self.gpus[entry.gpu_index].drm_output_manager.device())
+            {
+                eventline::warn!(
+                    "output {:?}: failed to restore gamma after {reason}: {err}",
+                    entry.output.name(),
+                );
+            }
+            set_entry_vrr(
+                entry,
+                configured_vrr_target(entry.configured_vrr, false, entry.vrr_support),
+            );
+            if !entry.dpms_enabled
+                && let Err(err) = entry
+                    .drm_output
+                    .with_compositor(|compositor| compositor.clear())
+            {
+                eventline::error!(
+                    "output {:?}: failed to restore DPMS-off state after {reason}: {err}",
+                    entry.output.name(),
+                );
+            }
+        }
+    }
+
+    /// Drop DRM master before a VT switch away.
+    pub fn pause(&mut self) {
+        for entry in &mut self.drm_outputs {
+            entry.discard_deferred_frame();
+        }
+        for gpu in &mut self.gpus {
+            gpu.drm_output_manager.pause();
+        }
+    }
+
+    /// Ask the active libseat session to switch virtual terminals.
+    ///
+    /// This stays TTY-backend-specific: nested sessions have no VT to own,
+    /// and the session notifier remains the sole authority for the ensuing
+    /// pause/resume lifecycle.
+    pub fn change_vt(&mut self, vt: i32) -> Result<(), Box<dyn Error>> {
+        self.session.change_vt(vt)?;
+        Ok(())
+    }
+
+    /// A cheap clone of the session, for building a libinput context
+    /// externally - matches the existing "notifiers aren't owned by the
+    /// backend, whatever drives the loop inserts them" pattern, extended to
+    /// input. `LibSeatSession` is `Clone` (internally `Weak`-based), so this
+    /// isn't a real second session.
+    pub fn session(&self) -> LibSeatSession {
+        self.session.clone()
+    }
+
+    pub fn with_renderer<T>(&mut self, f: impl FnOnce(&mut GlesRenderer) -> T) -> T {
+        let mut renderer = self
+            .gpu_manager
+            .single_renderer(&self.primary_render_node)
+            .expect("primary GPU renderer remains available");
+        f(renderer.as_mut())
+    }
+
+    /// Acknowledge a page-flip completion for one output, called from the
+    /// `DrmEvent::VBlank(crtc)` handler - the DRM-path equivalent of
+    /// `WinitBackend::request_redraw()`. Takes a `crtc::Handle` since with
+    /// multiple outputs "which one flipped" is no longer implicit. Must be
+    /// followed by a fresh `render()` call to queue that output's next frame.
+    pub fn frame_submitted(
+        &mut self,
+        gpu_index: usize,
+        crtc: crtc::Handle,
+    ) -> Result<Option<FrameSubmission>, Box<dyn Error>> {
+        if let Some(entry) = self
+            .drm_outputs
+            .iter_mut()
+            .find(|e| e.gpu_index == gpu_index && e.crtc == crtc)
+        {
+            // The kernel event completed the page flip regardless of whether
+            // Smithay can advance a queued follow-up frame. Clear our gate
+            // first so an acknowledgement error cannot wedge this output
+            // permanently in `pending`.
+            entry.pending = false;
+            entry.wake.vblank();
+            return entry.drm_output.frame_submitted().map_err(Into::into);
+        }
+        Ok(None)
+    }
+}
+
+impl Drop for TtyBackend {
+    fn drop(&mut self) {
+        // Clear our output KMS state while the seat still grants GPU access.
+        self.drm_outputs.clear();
+        // This native desktop owns the seat until logout. Once its outputs
+        // have been cleared, hand the display back to the seat/VT manager
+        // rather than replaying Smithay's startup property snapshot. That
+        // snapshot can reference obsolete framebuffers or mode blobs and
+        // the kernel rejects its restoration with EINVAL on this AMD setup.
+        // Pause only after surface drop: inactive surfaces skip KMS cleanup.
+        // Device pause also prevents notifier-held device references from
+        // issuing a late restoration after GPU access has been released.
+        for gpu in &mut self.gpus {
+            gpu.drm_output_manager.pause();
+        }
+        for gpu in self.gpus.drain(..) {
+            let TtyGpu {
+                render_node,
+                session_fd,
+                drm_fd,
+                drm_output_manager,
+                notifier,
+            } = gpu;
+            self.gpu_manager.as_mut().remove_node(&render_node);
+            // remove_node changes enumeration; refresh to release cached
+            // renderers before libseat revokes this device's access.
+            let _ = self.gpu_manager.devices();
+            drop(notifier);
+            drop(drm_output_manager);
+            drop(drm_fd);
+            if let Some(fd) = session_fd
+                && let Err(err) = self.session.close(fd)
+            {
+                eventline::warn!("tty: failed to close GPU session fd: {err}");
+            }
+        }
+    }
+}
+
+impl crate::ipc::OutputInfoSource for TtyBackend {
+    fn output_info(&self) -> Vec<swm_ipc::OutputInfo> {
+        let mut outputs = self.ipc_output_info.clone();
+        for entry in &self.drm_outputs {
+            if let Some(info) = outputs
+                .iter_mut()
+                .find(|info| info.name == entry.output.name())
+            {
+                info.vrr_supported = vrr_is_supported(entry.vrr_support);
+                info.vrr_active = entry.vrr_active && entry.dpms_enabled && entry.enabled;
+                if !entry.dpms_enabled || !entry.enabled {
+                    info.current_mode = None;
+                }
+            }
+        }
+        outputs
+    }
+}
+
+impl Renderable for TtyBackend {
+    fn render(
+        &mut self,
+        output: &Output,
+        request: RenderRequest<'_>,
+    ) -> Result<RenderOutcome, Box<dyn Error>> {
+        let primary_output = self.primary_output.clone();
+        let entry_index = self
+            .drm_outputs
+            .iter()
+            .position(|entry| &entry.output == output)
+            .ok_or_else(|| format!("unknown tty output {:?}", output.name()))?;
+        if !self.drm_outputs[entry_index].dpms_enabled || !self.drm_outputs[entry_index].enabled {
+            return Ok(RenderOutcome::new(RenderStatus::Skipped, None));
+        }
+        // DRM rejects a second commit while the previous page flip is still
+        // pending. The next VBlank clears this flag and schedules another
+        // render, so skipping here does not lose scene changes.
+        if self.drm_outputs[entry_index].pending {
+            return Ok(RenderOutcome::new(RenderStatus::Skipped, None));
+        }
+        // Temporary amdgpu workaround (see `wake`): bring woken outputs up
+        // one at a time.
+        let wakes: Vec<_> = self.drm_outputs.iter().map(|entry| entry.wake).collect();
+        if let Some(earlier) = wake::held_by(&wakes, entry_index, std::time::Instant::now()) {
+            eventline::debug!(
+                "tty dpms: {:?} waits for {:?} to finish waking (drm/amd#3504 workaround)",
+                output.name(),
+                self.drm_outputs[earlier].output.name()
+            );
+            return Ok(RenderOutcome::new(RenderStatus::Skipped, None).requiring_redraw());
+        }
+        if self.drm_outputs[entry_index].wake.owes_flip() {
+            // The ordinary flip the next output waits for must not be
+            // skipped as an empty frame.
+            self.drm_outputs[entry_index]
+                .drm_output
+                .with_compositor(|compositor| compositor.reset_buffer_ages());
+        }
+        let entry = &mut self.drm_outputs[entry_index];
+        if let Some(frame) = entry.deferred_frame.as_ref() {
+            match frame.readiness(request.desktop.session_lock.frame_generation()) {
+                Readiness::Obsolete => entry.discard_deferred_frame(),
+                Readiness::Pending => {
+                    return Ok(RenderOutcome::new(RenderStatus::Skipped, None).requiring_redraw());
+                }
+                Readiness::Ready => {
+                    let frame = entry.deferred_frame.take().expect("checked deferred frame");
+                    entry.submit_frame(frame.submission, frame.direct_scanout)?;
+                    // Input and client commits may have arrived during the wait.
+                    // Follow this presentation with a fresh scene even if idle.
+                    return Ok(
+                        RenderOutcome::new(RenderStatus::Submitted, Some(frame.states))
+                            .requiring_redraw(),
+                    );
+                }
+            }
+        }
+        let requested_vrr = configured_vrr_target(
+            self.drm_outputs[entry_index].configured_vrr,
+            request.frame.vrr_auto_eligible,
+            self.drm_outputs[entry_index].vrr_support,
+        );
+        set_entry_vrr(&mut self.drm_outputs[entry_index], requested_vrr);
+        let entry_output = self.drm_outputs[entry_index].output.clone();
+        let target_node = self.drm_outputs[entry_index].render_node;
+        let is_cross_gpu = target_node != self.primary_render_node;
+        let output_geometry = request
+            .desktop
+            .space
+            .output_geometry(&entry_output)
+            .ok_or_else(|| format!("tty output {:?} is not mapped", entry_output.name()))?;
+        let fifo = request.desktop.fifo;
+        let space = request.desktop.space;
+        let session_lock = request.desktop.session_lock;
+        let clear = if request.desktop.session_lock.active() {
+            crate::render::SESSION_LOCK_COLOR
+        } else {
+            request.frame.clear
+        };
+        let target_presentation_time = request.frame.target_presentation_time;
+        let force_full_repaint = request.frame.force_full_repaint;
+        let disable_hardware_cursor = request.cursor.cursor.hardware_cursor_disabled();
+        let session_lock_generation = request.desktop.session_lock.frame_generation();
+        let elements = {
+            let mut renderer = self
+                .gpu_manager
+                .single_renderer(&self.primary_render_node)
+                .map_err(|err| format!("primary renderer unavailable: {err:?}"))?;
+            crate::render::scene::build(
+                renderer.as_mut(),
+                &entry_output,
+                &primary_output,
+                output_geometry,
+                request,
+            )?
+        };
+        if force_full_repaint {
+            // Geometry animations (window open/close, zoom, camera motion)
+            // can touch a different pixel set in every swapchain buffer. A
+            // stale buffer-age history then presents old client pixels on
+            // alternating page flips. Preserve the buffers themselves, but
+            // make Smithay repaint the complete output for animated frames.
+            self.drm_outputs[entry_index]
+                .drm_output
+                .with_compositor(|compositor| compositor.reset_buffer_ages());
+        }
+        let (mut element_states, direct_scanout, is_empty, sync) = if !is_cross_gpu {
+            let mut renderer = self
+                .gpu_manager
+                .single_renderer(&self.primary_render_node)
+                .map_err(|err| format!("primary renderer unavailable: {err:?}"))?;
+            let result = self.drm_outputs[entry_index]
+                .drm_output
+                .render_frame::<_, SceneElement>(
+                    renderer.as_mut(),
+                    &elements,
+                    clear,
+                    dmabuf::frame_flags(disable_hardware_cursor),
+                )?;
+            let sync = if result.needs_sync()
+                && let PrimaryPlaneElement::Swapchain(element) = &result.primary_element
+            {
+                Some(element.sync.clone())
+            } else {
+                None
+            };
+            (
+                result.states.clone(),
+                matches!(&result.primary_element, PrimaryPlaneElement::Element(_)),
+                result.is_empty,
+                sync,
+            )
+        } else {
+            let mode_size = self.drm_outputs[entry_index].current_mode.size();
+            let mode_size = smithay::utils::Size::<i32, smithay::utils::Buffer>::from((
+                mode_size.0 as i32,
+                mode_size.1 as i32,
+            ));
+            let output_scale = Scale::from(entry_output.current_scale().fractional_scale());
+            // Scene elements are built in the output's transformed physical
+            // space (the same space used by `DrmOutput::render_frame`). Keep
+            // the intermediate texture in that space too; the final DRM
+            // render applies the output transform exactly once when it sends
+            // this texture to the secondary GPU's scanout buffer.
+            let (texture_size, logical_size) =
+                composed_texture_sizes(mode_size, entry_output.current_transform(), output_scale);
+            let (element_states, element) = {
+                let mut renderer = self
+                    .gpu_manager
+                    .single_renderer(&self.primary_render_node)
+                    .map_err(|err| format!("primary renderer unavailable: {err:?}"))?;
+                let entry = &mut self.drm_outputs[entry_index];
+                let needs_new = entry.composed_frame.as_ref().is_none_or(|frame| {
+                    !frame.matches(texture_size, output_scale, entry_output.current_transform())
+                });
+                if needs_new {
+                    let texture = <GlesRenderer as Offscreen<
+                        smithay::backend::renderer::gles::GlesTexture,
+                    >>::create_buffer(
+                        renderer.as_mut(), Fourcc::Abgr8888, texture_size
+                    )?;
+                    entry.composed_frame = Some(ComposedFrame::new(
+                        renderer.as_mut(),
+                        texture,
+                        output_scale,
+                        entry_output.current_transform(),
+                    ));
+                }
+                let frame = entry
+                    .composed_frame
+                    .as_mut()
+                    .expect("secondary output composition was initialized");
+                let states =
+                    frame.render(renderer.as_mut(), &elements, clear, force_full_repaint)?;
+                (
+                    states,
+                    PrimaryGpuTextureElement(frame.element(logical_size)),
+                )
+            };
+            let mut renderer = self
+                .gpu_manager
+                .renderer(
+                    &self.primary_render_node,
+                    &target_node,
+                    self.drm_outputs[entry_index].drm_output.format(),
+                )
+                .map_err(|err| format!("multi-GPU renderer unavailable: {err:?}"))?;
+            let elements = [element];
+            let result = match self.drm_outputs[entry_index]
+                .drm_output
+                .render_frame::<_, PrimaryGpuTextureElement>(
+                    &mut renderer,
+                    &elements,
+                    clear,
+                    FrameFlags::empty(),
+                ) {
+                Ok(result) => result,
+                Err(err) => {
+                    self.drm_outputs[entry_index]
+                        .drm_output
+                        .with_compositor(|compositor| compositor.reset_buffer_ages());
+                    return Err(err.into());
+                }
+            };
+            let sync = if result.needs_sync()
+                && let PrimaryPlaneElement::Swapchain(element) = &result.primary_element
+            {
+                Some(element.sync.clone())
+            } else {
+                None
+            };
+            (element_states, false, result.is_empty, sync)
+        };
+        crate::render::window_open::extend_render_states(&elements, &mut element_states);
+        let fifo_barriers = fifo.snapshot(&element_states);
+        if is_empty {
+            return Ok(
+                RenderOutcome::new(RenderStatus::Skipped, Some(element_states))
+                    .with_fifo(fifo_barriers),
+            );
+        }
+
+        let presentation_feedback = crate::wayland::presentation::take_output_feedback(
+            &entry_output,
+            &primary_output,
+            space,
+            session_lock,
+            &element_states,
+        );
+        let variable_refresh = self.drm_outputs[entry_index].vrr_active;
+        let submission = FrameSubmission {
+            fifo_barriers,
+            target_presentation_time,
+            presentation_feedback,
+            session_lock_generation,
+            variable_refresh,
+        };
+        let entry = &mut self.drm_outputs[entry_index];
+        if let Some(sync) = sync
+            && !sync.is_reached()
+        {
+            // Smithay retains the prepared swapchain frame until queue_frame
+            // or the next render_frame. Do not render over it while pending.
+            entry.deferred_frame = Some(DeferredFrame {
+                sync,
+                submission,
+                states: element_states,
+                direct_scanout,
+            });
+            return Ok(RenderOutcome::new(RenderStatus::Skipped, None).requiring_redraw());
+        }
+        entry.submit_frame(submission, direct_scanout)?;
+        let outcome = RenderOutcome::new(RenderStatus::Submitted, Some(element_states));
+        // A wake modeset owes one ordinary flip right after it.
+        Ok(if entry.wake.owes_flip() {
+            outcome.requiring_redraw()
+        } else {
+            outcome
+        })
+    }
+}
+
+impl DrmOutputEntry {
+    fn discard_deferred_frame(&mut self) {
+        if self.deferred_frame.take().is_some() {
+            // The prepared frame advanced damage history without reaching scanout.
+            self.drm_output
+                .with_compositor(|compositor| compositor.reset_buffer_ages());
+        }
+    }
+
+    fn submit_frame(
+        &mut self,
+        submission: FrameSubmission,
+        direct_scanout: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        if let Err(err) = self.drm_output.queue_frame(submission) {
+            self.drm_output
+                .with_compositor(|compositor| compositor.reset_buffer_ages());
+            return Err(err.into());
+        }
+        self.pending = true;
+        self.wake.submitted();
+        set_entry_direct_scanout(self, direct_scanout);
+        Ok(())
+    }
+}
+
+fn set_entry_vrr(entry: &mut DrmOutputEntry, requested: bool) {
+    let requested = requested && entry.dpms_enabled && vrr_is_supported(entry.vrr_support);
+    if requested == entry.vrr_active {
+        return;
+    }
+    let name = entry.output.name();
+    let previous = entry.vrr_active;
+    if let Err(err) = entry
+        .drm_output
+        .with_compositor(|compositor| compositor.use_vrr(requested))
+        && entry.vrr_failure_warned_for != Some(requested)
+    {
+        eventline::warn!(
+            "output {name:?}: failed to {} VRR: {err}",
+            if requested { "enable" } else { "disable" }
+        );
+        entry.vrr_failure_warned_for = Some(requested);
+    }
+    entry.vrr_active = entry
+        .drm_output
+        .with_compositor(|compositor| compositor.vrr_enabled());
+    if entry.vrr_active == requested {
+        entry.vrr_failure_warned_for = None;
+    } else if entry.vrr_failure_warned_for != Some(requested) {
+        eventline::warn!(
+            "output {name:?}: VRR {} request did not take effect",
+            if requested { "enable" } else { "disable" }
+        );
+        entry.vrr_failure_warned_for = Some(requested);
+    }
+    if entry.vrr_active != previous {
+        eventline::info!(
+            "output {name:?}: VRR {}",
+            if entry.vrr_active {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+    }
+}
+
+fn set_entry_direct_scanout(entry: &mut DrmOutputEntry, active: bool) {
+    if entry.direct_scanout_active == Some(active) {
+        return;
+    }
+    entry.direct_scanout_active = Some(active);
+    eventline::info!(
+        "output {:?}: render path is {}",
+        entry.output.name(),
+        if active {
+            "direct scanout"
+        } else {
+            "composited"
+        }
+    );
+}
+
+fn query_vrr_support(
+    drm_output: &TtyDrmOutput,
+    connector: connector::Handle,
+    name: &str,
+) -> VrrSupport {
+    match drm_output.with_compositor(|compositor| compositor.vrr_supported(connector)) {
+        Ok(support) => support,
+        Err(err) => {
+            eventline::warn!("output {name:?}: failed to query VRR support: {err}");
+            VrrSupport::NotSupported
+        }
+    }
+}
+
+fn vrr_is_supported(support: VrrSupport) -> bool {
+    !matches!(support, VrrSupport::NotSupported)
+}
+
+fn warn_vrr_configuration(name: &str, configured: swm_config::Vrr, support: VrrSupport) {
+    match (configured, support) {
+        (swm_config::Vrr::Off, _) | (_, VrrSupport::Supported) => {}
+        (_, VrrSupport::NotSupported) => {
+            eventline::warn!(
+                "output {name:?}: VRR is configured but the connector does not support it"
+            );
+        }
+        (swm_config::Vrr::Auto, VrrSupport::RequiresModeset) => {
+            eventline::warn!(
+                "output {name:?}: automatic VRR switching would require modesets, \
+                 so VRR remains disabled; use vrr \"on\" to enable it persistently"
+            );
+        }
+        (swm_config::Vrr::On, VrrSupport::RequiresModeset) => {}
+    }
+}
+
+fn configured_vrr_target(
+    configured: swm_config::Vrr,
+    auto_eligible: bool,
+    support: VrrSupport,
+) -> bool {
+    match configured {
+        swm_config::Vrr::Off => false,
+        swm_config::Vrr::On => vrr_is_supported(support),
+        swm_config::Vrr::Auto => auto_eligible && matches!(support, VrrSupport::Supported),
+    }
+}
+
+fn dpms_target_enabled(
+    command: swm_ipc::DpmsCommand,
+    current: impl IntoIterator<Item = bool>,
+) -> Option<bool> {
+    match command {
+        swm_ipc::DpmsCommand::Off => Some(false),
+        swm_ipc::DpmsCommand::On => Some(true),
+        swm_ipc::DpmsCommand::Toggle => {
+            let current = current.into_iter().collect::<Vec<_>>();
+            (!current.is_empty()).then(|| !current.iter().all(|enabled| *enabled))
+        }
+    }
+}
+
+#[cfg(test)]
+mod dpms_tests {
+    use smithay::backend::drm::VrrSupport;
+
+    use super::{configured_vrr_target, dpms_target_enabled};
+
+    #[test]
+    fn toggle_turns_all_off_only_when_every_target_is_on() {
+        assert_eq!(
+            dpms_target_enabled(swm_ipc::DpmsCommand::Toggle, [true, true]),
+            Some(false)
+        );
+        assert_eq!(
+            dpms_target_enabled(swm_ipc::DpmsCommand::Toggle, [true, false]),
+            Some(true)
+        );
+        assert_eq!(
+            dpms_target_enabled(swm_ipc::DpmsCommand::Toggle, [false, false]),
+            Some(true)
+        );
+        assert_eq!(dpms_target_enabled(swm_ipc::DpmsCommand::Toggle, []), None);
+    }
+
+    #[test]
+    fn vrr_policy_keeps_on_and_off_absolute_and_gates_auto() {
+        let supported = VrrSupport::Supported;
+        assert!(!configured_vrr_target(
+            swm_config::Vrr::Off,
+            true,
+            supported
+        ));
+        assert!(!configured_vrr_target(
+            swm_config::Vrr::Off,
+            false,
+            supported
+        ));
+        assert!(configured_vrr_target(swm_config::Vrr::On, true, supported));
+        assert!(configured_vrr_target(swm_config::Vrr::On, false, supported));
+        assert!(configured_vrr_target(
+            swm_config::Vrr::Auto,
+            true,
+            supported
+        ));
+        assert!(!configured_vrr_target(
+            swm_config::Vrr::Auto,
+            false,
+            supported
+        ));
+    }
+
+    #[test]
+    fn vrr_policy_does_not_dynamically_modeset_for_auto() {
+        assert!(!configured_vrr_target(
+            swm_config::Vrr::Auto,
+            true,
+            VrrSupport::RequiresModeset
+        ));
+        assert!(configured_vrr_target(
+            swm_config::Vrr::On,
+            false,
+            VrrSupport::RequiresModeset
+        ));
+        assert!(!configured_vrr_target(
+            swm_config::Vrr::On,
+            true,
+            VrrSupport::NotSupported
+        ));
+    }
+}
+
+#[cfg(test)]
+mod cross_gpu_composition_tests {
+    use super::composed_texture_sizes;
+    use smithay::utils::Scale;
+
+    #[test]
+    fn composed_texture_geometry_accounts_for_fractional_scale_and_rotation() {
+        let (texture_size, logical_size) = composed_texture_sizes(
+            (1920, 1080).into(),
+            smithay::utils::Transform::_90,
+            Scale::from(1.5),
+        );
+        assert_eq!(texture_size, (1080, 1920).into());
+        assert_eq!(logical_size, (720, 1280).into());
+    }
+}

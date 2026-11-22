@@ -1,0 +1,679 @@
+use std::collections::HashMap;
+use std::error::Error;
+use std::time::{Duration, Instant};
+
+use cosmic_text::{
+    Attrs, Buffer as TextBuffer, Color, Family, FontSystem, Hinting, Metrics, Shaping, Style,
+    SwashCache, Weight,
+};
+use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::element::texture::TextureRenderElement;
+use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
+use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, GlesTexture};
+use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
+use smithay::backend::renderer::{ContextId, ImportMem, Renderer, Texture};
+use smithay::utils::user_data::UserDataMap;
+use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Transform};
+
+const TEXT_CACHE_TTL: Duration = Duration::from_secs(30);
+const HINTING_MAX_SIZE_PX: u16 = 16;
+const RASTER_TRAILING_PAD_PX: i32 = 2;
+
+struct TextTexture {
+    texture: GlesTexture,
+    size: smithay::utils::Size<i32, Buffer>,
+    last_used: Instant,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct TextKey {
+    text: String,
+    family: String,
+    size_px: u16,
+    scale_120: u32,
+    rgb: [u8; 3],
+}
+
+/// Shared GLES text rasterizer & cache for compositor-owned overlays and labels.
+pub struct UiTextRenderer {
+    context: Option<ContextId<GlesTexture>>,
+    fonts: FontSystem,
+    swash: SwashCache,
+    font: swm_config::Font,
+    display_scale: f64,
+    text: HashMap<TextKey, TextTexture>,
+    /// Stable per-frame element IDs keyed by (label hash, frame occurrence).
+    ids: super::ids::ElementIds<(u64, u32)>,
+    occurrences: HashMap<u64, u32>,
+}
+
+fn text_key_hash(key: &TextKey) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
+
+impl Default for UiTextRenderer {
+    fn default() -> Self {
+        Self::new(&swm_config::Font::default())
+    }
+}
+
+impl UiTextRenderer {
+    pub fn new(font: &swm_config::Font) -> Self {
+        Self {
+            context: None,
+            fonts: FontSystem::new(),
+            swash: SwashCache::new(),
+            font: font.clone(),
+            display_scale: 1.0,
+            text: HashMap::new(),
+            ids: super::ids::ElementIds::default(),
+            occurrences: HashMap::new(),
+        }
+    }
+
+    pub fn set_display_scale(&mut self, scale: f64) {
+        self.display_scale = scale;
+    }
+
+    pub fn begin_scene(&mut self) {
+        self.occurrences.clear();
+        self.ids.advance();
+    }
+
+    pub fn reload_font(&mut self, font: &swm_config::Font) -> bool {
+        if self.font == *font {
+            return false;
+        }
+        self.font = font.clone();
+        self.text.clear();
+        true
+    }
+
+    pub fn measure(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        text: &str,
+        rgb: [u8; 3],
+    ) -> Result<Option<smithay::utils::Size<i32, Buffer>>, Box<dyn Error>> {
+        self.measure_with_size(renderer, text, rgb, None)
+    }
+
+    pub fn measure_at_size(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        text: &str,
+        rgb: [u8; 3],
+        size_px: u16,
+    ) -> Result<Option<smithay::utils::Size<i32, Buffer>>, Box<dyn Error>> {
+        self.measure_with_size(renderer, text, rgb, Some(size_px))
+    }
+
+    fn measure_with_size(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        text: &str,
+        rgb: [u8; 3],
+        size_px: Option<u16>,
+    ) -> Result<Option<smithay::utils::Size<i32, Buffer>>, Box<dyn Error>> {
+        let Some(key) = self.prepare_key(renderer, text, rgb, size_px)? else {
+            return Ok(None);
+        };
+        let entry = self.text.get_mut(&key).expect("text entry prepared");
+        entry.last_used = Instant::now();
+        Ok(Some(entry.size))
+    }
+
+    pub fn element(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        origin: Point<i32, Physical>,
+        text: &str,
+        rgb: [u8; 3],
+        alpha: f32,
+    ) -> Result<Option<PreparedUiText>, Box<dyn Error>> {
+        self.element_with_size(renderer, origin, text, rgb, alpha, None)
+    }
+
+    pub fn element_at_size(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        origin: Point<i32, Physical>,
+        text: &str,
+        rgb: [u8; 3],
+        alpha: f32,
+        size_px: u16,
+    ) -> Result<Option<PreparedUiText>, Box<dyn Error>> {
+        self.element_with_size(renderer, origin, text, rgb, alpha, Some(size_px))
+    }
+
+    fn element_with_size(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        origin: Point<i32, Physical>,
+        text: &str,
+        rgb: [u8; 3],
+        alpha: f32,
+        font_size_px: Option<u16>,
+    ) -> Result<Option<PreparedUiText>, Box<dyn Error>> {
+        if alpha <= 0.001 {
+            return Ok(None);
+        }
+        let Some(key) = self.prepare_key(renderer, text, rgb, font_size_px)? else {
+            return Ok(None);
+        };
+        let context = self.context.as_ref().expect("context prepared").clone();
+        let hash = text_key_hash(&key);
+        let occurrence = {
+            let seen = self.occurrences.entry(hash).or_insert(0);
+            let index = *seen;
+            *seen += 1;
+            index
+        };
+        let id = self.ids.id((hash, occurrence));
+        let entry = self.text.get_mut(&key).expect("text entry prepared");
+        entry.last_used = Instant::now();
+        let source = Rectangle::<f64, Logical>::new(
+            (0.0, 0.0).into(),
+            (entry.texture.size().w as f64, entry.texture.size().h as f64).into(),
+        );
+        let base = TextureRenderElement::from_static_texture(
+            id,
+            context,
+            origin.to_f64(),
+            entry.texture.clone(),
+            1,
+            Transform::Normal,
+            Some(alpha.clamp(0.0, 1.0)),
+            Some(source),
+            Some(entry.size.to_logical(1, Transform::Normal)),
+            None,
+            Kind::Unspecified,
+        );
+        Ok(Some(PreparedUiText {
+            element: UiTextElement { base },
+        }))
+    }
+
+    fn prepare_key(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        text: &str,
+        rgb: [u8; 3],
+        size_px: Option<u16>,
+    ) -> Result<Option<TextKey>, Box<dyn Error>> {
+        if text.is_empty() {
+            return Ok(None);
+        }
+        self.ensure_context(renderer);
+        let now = Instant::now();
+        self.text
+            .retain(|_, entry| now.saturating_duration_since(entry.last_used) < TEXT_CACHE_TTL);
+        let key = TextKey {
+            text: text.to_string(),
+            family: normalized_family(&self.font),
+            size_px: effective_font_size(&self.font, size_px),
+            scale_120: (self.display_scale * 120.0).round() as u32,
+            rgb,
+        };
+        if !self.text.contains_key(&key) {
+            let scaled_px = (key.size_px as f64 * self.display_scale).round().max(1.0) as u16;
+            let Some((pixels, size)) = raster_text(
+                &mut self.fonts,
+                &mut self.swash,
+                &key.text,
+                scaled_px,
+                key.rgb,
+                &key.family,
+            ) else {
+                return Ok(None);
+            };
+            let texture = renderer.import_memory(&pixels, Fourcc::Abgr8888, size.into(), false)?;
+            let logical_size = if self.display_scale == 1.0 {
+                size.into()
+            } else {
+                measure_text(
+                    &mut self.fonts,
+                    &mut self.swash,
+                    &key.text,
+                    key.size_px,
+                    &key.family,
+                )
+                .into()
+            };
+            self.text.insert(
+                key.clone(),
+                TextTexture {
+                    texture,
+                    size: logical_size,
+                    last_used: now,
+                },
+            );
+        }
+        Ok(Some(key))
+    }
+
+    fn ensure_context(&mut self, renderer: &GlesRenderer) {
+        let context = renderer.context_id();
+        if self.context.as_ref() == Some(&context) {
+            return;
+        }
+        self.context = Some(context);
+        self.text.clear();
+    }
+}
+
+pub struct PreparedUiText {
+    pub element: UiTextElement,
+}
+
+#[derive(Debug)]
+pub struct UiTextElement {
+    base: TextureRenderElement<GlesTexture>,
+}
+
+fn normalized_family(font: &swm_config::Font) -> String {
+    let family = font.family.trim();
+    if family.is_empty() {
+        swm_config::Font::default().family
+    } else {
+        family.to_string()
+    }
+}
+
+fn configured_font_size(font: &swm_config::Font) -> u16 {
+    font.size.max(1)
+}
+
+fn effective_font_size(font: &swm_config::Font, override_px: Option<u16>) -> u16 {
+    override_px
+        .unwrap_or_else(|| configured_font_size(font))
+        .max(1)
+}
+
+fn shape_buffer(
+    font_system: &mut FontSystem,
+    text: &str,
+    size_px: u16,
+    family: &str,
+) -> TextBuffer {
+    let font_size = size_px.max(1) as f32;
+    let mut buffer = TextBuffer::new(
+        font_system,
+        Metrics::new(font_size, (font_size * 1.25).ceil()),
+    );
+    buffer.set_hinting(if size_px <= HINTING_MAX_SIZE_PX {
+        Hinting::Enabled
+    } else {
+        Hinting::Disabled
+    });
+    buffer.set_size(None, None);
+    let request = parse_font_request(family);
+    let resolved = resolve_named_family(font_system, request.family);
+    buffer.set_text(
+        text,
+        &Attrs::new()
+            .family(resolve_family(
+                resolved.as_deref().unwrap_or(request.family),
+            ))
+            .style(request.style)
+            .weight(request.weight),
+        Shaping::Advanced,
+        None,
+    );
+    buffer
+}
+
+fn measure_text(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    text: &str,
+    size_px: u16,
+    family: &str,
+) -> (i32, i32) {
+    let font_size = size_px.max(1) as f32;
+    let mut buffer = shape_buffer(font_system, text, size_px, family);
+    buffer.shape_until_scroll(font_system, true);
+
+    let mut width = 0_i32;
+    let mut height = 0_i32;
+    for run in buffer.layout_runs() {
+        width = width.max(run.line_w.ceil() as i32);
+        height = height.max((run.line_top + run.line_height).ceil() as i32);
+        for glyph in run.glyphs {
+            let physical = glyph.physical((0.0, run.line_y), 1.0);
+            if let Some(image) = swash_cache
+                .get_image(font_system, physical.cache_key)
+                .as_ref()
+            {
+                let glyph_width = i32::try_from(image.placement.width).unwrap_or(i32::MAX);
+                let right = physical
+                    .x
+                    .saturating_add(image.placement.left)
+                    .saturating_add(glyph_width);
+                width = width.max(right);
+            }
+        }
+    }
+    width = width.max(1).saturating_add(RASTER_TRAILING_PAD_PX);
+    height = height.max((font_size * 1.25).ceil() as i32).max(1);
+    (width, height)
+}
+
+fn raster_text(
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+    text: &str,
+    size_px: u16,
+    rgb: [u8; 3],
+    family: &str,
+) -> Option<(Vec<u8>, (i32, i32))> {
+    if text.is_empty() {
+        return None;
+    }
+    let font_size = size_px.max(1) as f32;
+    let mut buffer = shape_buffer(font_system, text, size_px, family);
+    buffer.shape_until_scroll(font_system, true);
+
+    let mut width = 0_i32;
+    let mut height = 0_i32;
+    for run in buffer.layout_runs() {
+        width = width.max(run.line_w.ceil() as i32);
+        height = height.max((run.line_top + run.line_height).ceil() as i32);
+        for glyph in run.glyphs {
+            let physical = glyph.physical((0.0, run.line_y), 1.0);
+            if let Some(image) = swash_cache
+                .get_image(font_system, physical.cache_key)
+                .as_ref()
+            {
+                let glyph_width = i32::try_from(image.placement.width).unwrap_or(i32::MAX);
+                let right = physical
+                    .x
+                    .saturating_add(image.placement.left)
+                    .saturating_add(glyph_width);
+                width = width.max(right);
+            }
+        }
+    }
+    width = width.max(1).saturating_add(RASTER_TRAILING_PAD_PX);
+    height = height.max((font_size * 1.25).ceil() as i32).max(1);
+
+    let mut pixels = vec![0_u8; width as usize * height as usize * 4];
+    let color = Color::rgba(rgb[0], rgb[1], rgb[2], 255);
+    for run in buffer.layout_runs() {
+        for glyph in run.glyphs {
+            let physical = glyph.physical((0.0, run.line_y), 1.0);
+            swash_cache.with_pixels(font_system, physical.cache_key, color, |gx, gy, pixel| {
+                let x = physical.x + gx;
+                let y = physical.y + gy;
+                if x < 0 || y < 0 || x >= width || y >= height {
+                    return;
+                }
+                let index = ((y as usize * width as usize) + x as usize) * 4;
+                let alpha = pixel.a() as f32 / 255.0;
+                // Smithay GLES expects premultiplied RGBA.
+                pixels[index] = (pixel.r() as f32 * alpha).round() as u8;
+                pixels[index + 1] = (pixel.g() as f32 * alpha).round() as u8;
+                pixels[index + 2] = (pixel.b() as f32 * alpha).round() as u8;
+                pixels[index + 3] = pixel.a();
+            });
+        }
+    }
+    Some((pixels, (width, height)))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FontRequest<'a> {
+    family: &'a str,
+    style: Style,
+    weight: Weight,
+}
+
+fn parse_font_request(requested: &str) -> FontRequest<'_> {
+    let trimmed = requested.trim();
+    let mut family = if trimmed.is_empty() {
+        "monospace"
+    } else {
+        trimmed
+    };
+    let mut style = Style::Normal;
+    let mut weight = Weight::NORMAL;
+    loop {
+        if style == Style::Normal {
+            if let Some(stripped) = strip_suffix(family, &[" italic"]) {
+                family = stripped;
+                style = Style::Italic;
+                continue;
+            }
+            if let Some(stripped) = strip_suffix(family, &[" oblique"]) {
+                family = stripped;
+                style = Style::Oblique;
+                continue;
+            }
+        }
+        if weight == Weight::NORMAL {
+            for (suffixes, parsed) in [
+                (
+                    &[" extra bold", " extra-bold", " extrabold"][..],
+                    Weight::EXTRA_BOLD,
+                ),
+                (
+                    &[" semi bold", " semi-bold", " semibold"][..],
+                    Weight::SEMIBOLD,
+                ),
+                (
+                    &[" extra light", " extra-light", " extralight"][..],
+                    Weight::EXTRA_LIGHT,
+                ),
+                (&[" bold"][..], Weight::BOLD),
+                (&[" medium"][..], Weight::MEDIUM),
+                (&[" light"][..], Weight::LIGHT),
+                (&[" thin"][..], Weight::THIN),
+                (&[" black"][..], Weight::BLACK),
+            ] {
+                if let Some(stripped) = strip_suffix(family, suffixes) {
+                    family = stripped;
+                    weight = parsed;
+                    break;
+                }
+            }
+            if weight != Weight::NORMAL {
+                continue;
+            }
+        }
+        break;
+    }
+    FontRequest {
+        family,
+        style,
+        weight,
+    }
+}
+
+fn strip_suffix<'a>(family: &'a str, suffixes: &[&str]) -> Option<&'a str> {
+    let folded = family.to_ascii_lowercase();
+    suffixes.iter().find_map(|suffix| {
+        folded
+            .ends_with(suffix)
+            .then(|| family[..family.len() - suffix.len()].trim_end())
+    })
+}
+
+fn resolve_family(family: &str) -> Family<'_> {
+    match family.trim().to_ascii_lowercase().as_str() {
+        "serif" => Family::Serif,
+        "sans-serif" | "sans_serif" | "sansserif" | "sans" => Family::SansSerif,
+        "cursive" => Family::Cursive,
+        "fantasy" => Family::Fantasy,
+        "monospace" => Family::Monospace,
+        _ => Family::Name(family),
+    }
+}
+
+fn resolve_named_family(font_system: &FontSystem, requested: &str) -> Option<String> {
+    if matches!(
+        resolve_family(requested),
+        Family::Serif | Family::SansSerif | Family::Cursive | Family::Fantasy | Family::Monospace
+    ) {
+        return None;
+    }
+    let requested = fold_font_name(requested);
+    font_system.db().faces().find_map(|face| {
+        face.families
+            .iter()
+            .map(|(family, _)| family.as_str())
+            .find(|family| fold_font_name(family) == requested)
+            .map(str::to_string)
+            .or_else(|| {
+                (fold_font_name(&face.post_script_name) == requested)
+                    .then(|| face.families.first().map(|(family, _)| family.clone()))
+                    .flatten()
+            })
+    })
+}
+
+fn fold_font_name(name: &str) -> String {
+    name.chars()
+        .filter(|character| !matches!(character, ' ' | '-' | '_'))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+impl Element for UiTextElement {
+    fn id(&self) -> &Id {
+        self.base.id()
+    }
+    fn current_commit(&self) -> CommitCounter {
+        self.base.current_commit()
+    }
+    fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.base.geometry(scale)
+    }
+    fn transform(&self) -> Transform {
+        self.base.transform()
+    }
+    fn src(&self) -> Rectangle<f64, Buffer> {
+        self.base.src()
+    }
+    fn damage_since(
+        &self,
+        scale: Scale<f64>,
+        commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        self.base.damage_since(scale, commit)
+    }
+    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        self.base.opaque_regions(scale)
+    }
+    fn alpha(&self) -> f32 {
+        self.base.alpha()
+    }
+    fn kind(&self) -> Kind {
+        self.base.kind()
+    }
+}
+
+impl RenderElement<GlesRenderer> for UiTextElement {
+    fn draw(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&UserDataMap>,
+    ) -> Result<(), GlesError> {
+        <TextureRenderElement<GlesTexture> as RenderElement<GlesRenderer>>::draw(
+            &self.base,
+            frame,
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            cache,
+        )
+    }
+
+    fn underlying_storage(&self, renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
+        <TextureRenderElement<GlesTexture> as RenderElement<GlesRenderer>>::underlying_storage(
+            &self.base, renderer,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_size_is_used_without_per_overlay_offsets() {
+        let font = swm_config::Font {
+            family: "monospace".to_string(),
+            size: 11,
+        };
+        assert_eq!(configured_font_size(&font), 11);
+        assert_eq!(
+            configured_font_size(&swm_config::Font {
+                family: "monospace".to_string(),
+                size: 0,
+            }),
+            1
+        );
+        assert_eq!(effective_font_size(&font, None), 11);
+        assert_eq!(effective_font_size(&font, Some(18)), 18);
+        assert_eq!(effective_font_size(&font, Some(0)), 1);
+    }
+
+    #[test]
+    fn font_reload_only_invalidates_on_change() {
+        let mut renderer = UiTextRenderer::default();
+        assert!(!renderer.reload_font(&swm_config::Font::default()));
+        assert!(renderer.reload_font(&swm_config::Font {
+            family: "sans-serif".to_string(),
+            size: 12,
+        }));
+    }
+
+    #[test]
+    #[ignore = "requires surfaceless GLES; run with LIBGL_ALWAYS_SOFTWARE=1 and --ignored"]
+    fn display_scale_rasterizes_text_at_native_density_and_separates_caches() {
+        use smithay::backend::egl::{EGLContext, EGLDisplay, native::EGLSurfacelessDisplay};
+        let display = unsafe { EGLDisplay::new(EGLSurfacelessDisplay) }.unwrap();
+        let context = EGLContext::new(&display).unwrap();
+        let mut renderer = unsafe { GlesRenderer::new(context) }.unwrap();
+        let mut text = UiTextRenderer::default();
+        let base_key = text
+            .prepare_key(&mut renderer, "SWM display scale", [255; 3], None)
+            .unwrap()
+            .unwrap();
+        let base = text.text[&base_key].texture.size();
+        text.set_display_scale(2.0);
+        let scaled_key = text
+            .prepare_key(&mut renderer, "SWM display scale", [255; 3], None)
+            .unwrap()
+            .unwrap();
+        let scaled = text.text[&scaled_key].texture.size();
+        assert_ne!(base_key, scaled_key);
+        assert!(
+            scaled.w >= base.w * 3 / 2 && scaled.h >= base.h * 3 / 2,
+            "{base:?} -> {scaled:?}"
+        );
+        let measured = text
+            .measure(&mut renderer, "SWM display scale", [255; 3])
+            .unwrap()
+            .unwrap();
+        assert!(
+            measured.w.abs_diff(base.w) <= 3,
+            "logical label layout changed: {base:?} -> {measured:?}"
+        );
+        text.set_display_scale(1.0);
+        assert_eq!(
+            text.prepare_key(&mut renderer, "SWM display scale", [255; 3], None)
+                .unwrap()
+                .unwrap(),
+            base_key
+        );
+    }
+}

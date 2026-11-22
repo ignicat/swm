@@ -1,0 +1,105 @@
+[package]
+name = "swm"
+version = "0.1.0"
+edition = "2024"
+description = "simple window manager — spatial Wayland window manager built around per-monitor canvases"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
+
+[workspace]
+resolver = "2"
+members = ["swm-api", "swm-cli", "swm-config", "swm-core", "swm-ipc", "swm-portal"]
+
+[workspace.package]
+license = "GPL-3.0-only"
+repository = "https://github.com/ignicat/swm"
+homepage = "https://github.com/ignicat/swm"
+keywords = ["wayland", "window-manager", "compositor", "rust", "linux"]
+categories = ["os::linux-apis", "gui"]
+
+[workspace.dependencies]
+# 0.7.1 adds the signed numbers used by configuration offsets.
+rune-cfg = "0.7.1"
+
+[dependencies]
+smithay = { git = "https://github.com/Smithay/smithay.git", rev = "65aa86fa5236e41775c313408102a5d5c2d1e2ca", default-features = false, features = [
+  "backend_egl",
+  "renderer_gl",
+  "backend_session",
+  "backend_session_libseat",
+  "backend_drm",
+  "backend_gbm",
+  "backend_udev",
+  "backend_libinput",
+  "renderer_multi",
+  "wayland_frontend",
+  "use_system_lib",
+  "desktop",
+] }
+smithay-drm-extras = { git = "https://github.com/Smithay/smithay.git", rev = "65aa86fa5236e41775c313408102a5d5c2d1e2ca" }
+calloop = "0.14.4"
+cgmath = "0.18"
+cosmic-text = { version = "0.19", features = ["swash"] }
+swm-api = { version = "0.1.0", path = "swm-api", features = ["wayland-server"] }
+eventline = "0.9.0"
+accesskit = { version = "0.25.1", optional = true }
+accesskit_unix = { version = "0.24.0", optional = true }
+futures-util = { version = "0.3", optional = true }
+drm-ffi = "0.9.1"
+swm-config = { version = "0.1.0", path = "swm-config" }
+swm-core = { version = "0.1.0", path = "swm-core" }
+swm-ipc = { version = "0.1.0", path = "swm-ipc" }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+libc = "0.2"
+resvg = { version = "0.47", default-features = false }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "registry",
+    "std",
+] }
+wayland-protocols-wlr = { version = "0.3.12", features = ["server"] }
+xcursor = "0.3"
+x11rb = { version = "0.14.0", optional = true, features = ["xkb", "randr"] }
+zbus = { version = "5.16", optional = true }
+sd-notify = { version = "0.5", optional = true }
+
+[features]
+default = ["dbus", "systemd", "xwayland", "winit"]
+# In-process accessibility monitoring and native idle-inhibition services.
+dbus = ["dep:futures-util", "dep:zbus", "dep:accesskit", "dep:accesskit_unix"]
+# User-manager environment publishing and readiness notification.
+systemd = ["dep:sd-notify"]
+dinit = []
+# Native XWayland server and window-manager integration.
+xwayland = ["dep:x11rb", "smithay/xwayland"]
+# Nested compositor backend for development and testing.
+winit = ["smithay/backend_winit"]
+
+[dev-dependencies]
+swm-api = { version = "0.1.0", path = "swm-api", features = ["wayland-client", "test-support"] }
+rune-cfg.workspace = true
+wayland-client = "0.31.14"
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
+# `staging` exposes client bindings for `ext_image_capture_source_v1` and
+# `ext_image_copy_capture_v1`; `unstable` covers the Smithay protocol tests.
+wayland-protocols = { version = "0.32.12", features = ["client", "staging", "unstable"] }
+wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
+serde_json = "1.0"
+
+# swm itself stays unoptimized so incremental rebuilds are fast, but the
+# dependency graph (smithay, cosmic-text, resvg, image) is compiled with
+# full optimization. Those crates do the per-frame work, and at opt-level 0
+# they dominate the profile of a dogfooded dev session.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Standalone test process so the nested window/event loop stays on the main
+# thread. `cfg(test)` keeps its two-output/input controls out of normal builds.
+[[test]]
+name = "nested_fullscreen_server"
+path = "tests/support/nested_fullscreen_server.rs"
+harness = false
